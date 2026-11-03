@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -25,8 +26,17 @@ TITLE = "Offerberg temp"
 def http_json(url, data=None, headers=None, timeout=20):
     body = urllib.parse.urlencode(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        raise RuntimeError(f"HTTP {e.code} {detail}") from None
+
+
+def clean(v):
+    """Tar bort blanksteg och citattecken (docker env_file behåller dem)."""
+    return v.strip().strip("\"'")
 
 
 def ecowitt_temps(env):
@@ -51,8 +61,8 @@ def adax_rooms_heating(env):
     tok = http_json(
         "https://api-1.adax.no/client-api/auth/token",
         data={"grant_type": "password",
-              "username": env["ADAX_CLIENT_ID"],
-              "password": env["ADAX_CLIENT_SECRET"]},
+              "username": clean(env["ADAX_CLIENT_ID"]),
+              "password": clean(env["ADAX_CLIENT_SECRET"])},
     )["access_token"]
     j = http_json("https://api-1.adax.no/client-api/rest/v1/content/",
                   headers={"Authorization": f"Bearer {tok}"})
