@@ -234,3 +234,7 @@ def test_load_samples_skips_bad_and_dupes():
         f.write(json.dumps(ok) + "\n" + "inte json\n" + json.dumps(ok) + "\n"
                 + json.dumps({"t": NOW, "id": 2, "et": 5, "wh": None}) + "\n")
     assert len(o.load_samples(env, NOW + 1)) == 1
+
+
+def test_energy_line_has_no_spot_line():
+    assert "Snittspot" not in o.energy_line(1000, 1.0, None, None, note="x")

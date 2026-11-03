@@ -263,8 +263,6 @@ def energy_line(wh, price, start_ms=None, now=None, note=None,
         line += " – OBS: Adax saknar data för delar av perioden"
     elif estimated:
         line += " – uppskattat"
-    if note and price is not None:
-        line += f"\n  Snittspot: {note}"
     if price is None:
         line += " (elpris ej inställt)"
     return line
