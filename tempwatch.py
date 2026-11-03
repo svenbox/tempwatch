@@ -9,6 +9,7 @@ Körning:
 """
 import argparse
 import datetime as dt
+import html
 import json
 import os
 import sys
@@ -87,12 +88,36 @@ def build_message(outdoor, indoor, rooms):
     return "\n".join(lines)
 
 
+def telegram_token(env):
+    """Samma namn som baxlio (TELEGRAM_TOKEN); TELEGRAM_BOT_TOKEN som reserv."""
+    return clean(env.get("TELEGRAM_TOKEN") or env.get("TELEGRAM_BOT_TOKEN") or "")
+
+
+def telegram_html(text):
+    """Första raden (rubriken) i fetstil, resten som vanlig text."""
+    head, _, rest = text.partition("\n")
+    out = f"<b>{html.escape(head)}</b>"
+    return out + ("\n" + html.escape(rest) if rest else "")
+
+
 def telegram_send(env, text):
-    r = http_json(
-        f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/sendMessage",
-        data={"chat_id": env["TELEGRAM_CHAT_ID"], "text": text})
-    if not r.get("ok"):
-        raise RuntimeError(f"Telegram: {r}")
+    token, chat = telegram_token(env), clean(env.get("TELEGRAM_CHAT_ID", ""))
+    if not token or not chat:
+        raise RuntimeError("Telegram: TELEGRAM_TOKEN eller TELEGRAM_CHAT_ID saknas")
+    body = json.dumps({"chat_id": chat, "text": telegram_html(text),
+                       "parse_mode": "HTML",
+                       "disable_web_page_preview": True}).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage", body,
+        {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            resp = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Telegram HTTP {e.code} "
+                           f"{e.read().decode(errors='replace')[:200]}") from None
+    if not resp.get("ok"):
+        raise RuntimeError(f"Telegram: {resp}")
 
 
 def run_once(env, dry=False):

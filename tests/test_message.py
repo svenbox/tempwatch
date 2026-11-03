@@ -27,3 +27,12 @@ def test_heating_rooms():
         {"name": "B", "heatingEnabled": False, "temperature": 1800},
         {"name": "C", "heatingEnabled": True}]}
     assert o.heating_rooms(j) == [("A", 21.5)]
+
+
+def test_telegram_html_bold_title_and_escape():
+    assert o.telegram_html("Offerberg temp\nA < B") == "<b>Offerberg temp</b>\nA &lt; B"
+
+
+def test_token_names():
+    assert o.telegram_token({"TELEGRAM_TOKEN": " x "}) == "x"
+    assert o.telegram_token({"TELEGRAM_BOT_TOKEN": "y"}) == "y"
