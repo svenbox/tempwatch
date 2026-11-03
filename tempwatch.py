@@ -66,8 +66,14 @@ def adax_rooms_heating(env):
     )["access_token"]
     j = http_json("https://api-1.adax.no/client-api/rest/v1/content/",
                   headers={"Authorization": f"Bearer {tok}"})
-    return [(r["name"], r["currentTemperature"] / 100)
-            for r in j.get("rooms", []) if r.get("heatingEnabled")]
+    return heating_rooms(j)
+
+
+def heating_rooms(j):
+    """Rum med värme på. Adax anger temperaturer som heltal gånger 100."""
+    return [(r["name"], r["temperature"] / 100)
+            for r in j.get("rooms", [])
+            if r.get("heatingEnabled") and "temperature" in r]
 
 
 def fmt(v):

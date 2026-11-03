@@ -19,3 +19,11 @@ def test_next_run_before_and_after_0730():
     after = dt.datetime(2026, 11, 3, 8, 0, tzinfo=tz)
     assert o.seconds_until_next(before) == 30 * 60
     assert o.seconds_until_next(after) == 23.5 * 3600
+
+
+def test_heating_rooms():
+    j = {"rooms": [
+        {"name": "A", "heatingEnabled": True, "temperature": 2150},
+        {"name": "B", "heatingEnabled": False, "temperature": 1800},
+        {"name": "C", "heatingEnabled": True}]}
+    assert o.heating_rooms(j) == [("A", 21.5)]
