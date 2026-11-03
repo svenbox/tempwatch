@@ -5,7 +5,7 @@ import tempwatch as o
 def test_message_format():
     m = o.build_message(3.04, 21.5, [("Vardagsrum", 20.99), ("Sovrum", 18.0)])
     assert m.splitlines() == [
-        "Offerberg temp", "Utomhus: 3,0 °C", "Inomhus: 21,5 °C",
+        "Offerberg temp", "Utomhus: 3,0 °C", "Inomhus (köket): 21,5 °C",
         "Dessa rum har värme på:", "  Vardagsrum: 21,0 °C", "  Sovrum: 18,0 °C"]
 
 

@@ -269,7 +269,7 @@ def energy_line(wh, price, start_ms=None, now=None, note=None,
 
 
 def build_message(outdoor, indoor, rooms, energy=None):
-    lines = [TITLE, f"Utomhus: {fmt(outdoor)}", f"Inomhus: {fmt(indoor)}",
+    lines = [TITLE, f"Utomhus: {fmt(outdoor)}", f"Inomhus (köket): {fmt(indoor)}",
              "Dessa rum har värme på:"]
     lines += [f"  {n}: {fmt(t)}" for n, t in rooms] or ["  (inga)"]
     if energy:
