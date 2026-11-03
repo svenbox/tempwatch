@@ -361,6 +361,31 @@ def run_once(env, dry=False):
         telegram_send(env, msg)
 
 
+SAMPLE_EVERY = 15 * 60
+
+
+def samples_path(env):
+    return os.path.join(os.path.dirname(state_path(env)), "devices.jsonl")
+
+
+def sample_rows(content, now_ms):
+    """En rad per element: tid, enhet, rum, Wh och Adax energyTime."""
+    return [{"t": int(now_ms), "id": d.get("id"), "room": d.get("roomId"),
+             "wh": d.get("energyWh"), "et": d.get("energyTime")}
+            for d in content.get("devices", [])]
+
+
+def sample_devices(env):
+    """Loggar Adax timenergi per element (underlag för att avgöra om den går att lita på)."""
+    token = adax_token(env)
+    j = http_json(f"{ADAX}/rest/v1/content/?withEnergy=1",
+                  headers={"Authorization": f"Bearer {token}"})
+    rows = sample_rows(j, time.time() * 1000)
+    with open(samples_path(env), "a") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
 def seconds_until_next(now=None):
     now = now or dt.datetime.now(TZ)
     nxt = now.replace(hour=SEND_AT.hour, minute=SEND_AT.minute,
@@ -447,13 +472,24 @@ def main():
     if a.once or a.dry_run:
         run_once(env, dry=a.dry_run)
         return
+    next_send = time.time() + seconds_until_next()
+    next_sample = time.time()
     while True:
-        time.sleep(seconds_until_next())
-        try:
-            run_once(env)
-        except Exception as e:  # håll loopen vid liv
-            print(f"Fel: {e}", file=sys.stderr)
-        time.sleep(60)
+        time.sleep(max(min(next_send, next_sample) - time.time(), 0) + 0.5)
+        now = time.time()
+        if now >= next_sample:
+            try:
+                sample_devices(env)
+            except Exception as e:  # provtagning får aldrig stoppa notisen
+                print(f"Provtagning misslyckades: {e}", file=sys.stderr)
+            next_sample = time.time() + SAMPLE_EVERY
+        if now >= next_send:
+            try:
+                run_once(env)
+            except Exception as e:  # håll loopen vid liv
+                print(f"Fel: {e}", file=sys.stderr)
+            next_send = time.time() + 61 + seconds_until_next(
+                dt.datetime.now(TZ) + dt.timedelta(seconds=61))
 
 
 if __name__ == "__main__":

@@ -173,3 +173,9 @@ def test_user_agent_is_sent():
     finally:
         urllib.request.urlopen = orig
     assert seen["ua"].startswith("tempwatch/")
+
+
+def test_sample_rows():
+    j = {"devices": [{"id": 1, "roomId": 9, "energyWh": 242, "energyTime": 5, "name": "x"}]}
+    assert o.sample_rows(j, 10.9) == [{"t": 10, "id": 1, "room": 9, "wh": 242, "et": 5}]
+    assert o.sample_rows({}, 1) == []
