@@ -22,11 +22,13 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo(os.environ.get("TZ", "Europe/Stockholm"))
 SEND_AT = dt.time(7, 30)
 TITLE = "Offerberg temp"
+USER_AGENT = "tempwatch/1.0 (+https://github.com/svenbox/tempwatch)"
 
 
 def http_json(url, data=None, headers=None, timeout=20):
     body = urllib.parse.urlencode(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers or {})
+    hdrs = {"User-Agent": USER_AGENT, **(headers or {})}
+    req = urllib.request.Request(url, data=body, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.load(r)
@@ -113,6 +115,21 @@ def energy_since(points, start_ms, now_ms, snaps=()):
     return total, estimated, current
 
 
+def covered_ms(points, start_ms, now_ms):
+    """Hur många ms av [start, nu] som täcks av dygnspunkter (utan dubbletter)."""
+    spans = sorted({(max(int(p["fromTime"]), start_ms), min(int(p["toTime"]), now_ms))
+                    for p in points})
+    total, end = 0, start_ms
+    for f, t in spans:
+        if t <= f:
+            continue
+        f = max(f, end)
+        if t > f:
+            total += t - f
+            end = t
+    return total
+
+
 def window_start(now=None):
     """Igår kl 07:30 lokal tid (ms)."""
     now = now or dt.datetime.now(TZ)
@@ -142,19 +159,23 @@ def save_state(env, state):
 
 
 def adax_energy(env, token, room_ids, start_ms, now_ms, state):
-    """(Wh, uppskattat, nya ögonblicksbilder {rum: [...]})."""
-    total, est, new = 0.0, False, {}
+    """(Wh, uppskattat, nya ögonblicksbilder {rum: [...]}, ofullständigt)."""
+    total, est, new, best = 0.0, False, {}, 0
     cutoff = now_ms - 4 * 86400 * 1000
     for rid in room_ids:
         key = str(rid)
         snaps = [x for x in state.get(key, []) if x["at"] > cutoff]
-        wh, e, cur = energy_since(adax_points(token, rid), start_ms, now_ms, snaps)
+        pts = adax_points(token, rid)
+        best = max(best, covered_ms(pts, start_ms, now_ms))
+        wh, e, cur = energy_since(pts, start_ms, now_ms, snaps)
         total += wh
         est = est or e
         if cur:
             snaps.append({"at": int(now_ms), **cur})
         new[key] = snaps
-    return total, est, new
+    # Ofullständigt om inget rum har data för hela perioden (minuttolerans).
+    incomplete = best < (now_ms - start_ms) - 60_000
+    return total, est, new, incomplete
 
 
 def spot_average(area, start_ms, now_ms):
@@ -231,13 +252,16 @@ def since_label(start_ms, now=None):
     return f"{day} {st:%H:%M}"
 
 
-def energy_line(wh, price, start_ms=None, now=None, note=None, estimated=False):
+def energy_line(wh, price, start_ms=None, now=None, note=None,
+                estimated=False, incomplete=False):
     kwh = wh / 1000
     since = f" sedan {since_label(start_ms, now)}" if start_ms else ""
     line = f"Energiförbrukning{since}: {fmt_num(kwh, 1)} kWh"
     if price is not None:
         line += f" (≈ {fmt_num(kwh * price, 2)} kr)"
-    if estimated:
+    if incomplete:
+        line += " – OBS: Adax saknar data för delar av perioden"
+    elif estimated:
         line += " – uppskattat"
     if note and price is not None:
         line += f"\n  Snittspot: {note}"
@@ -303,7 +327,7 @@ def run_once(env, dry=False):
             now_ms = time.time() * 1000
             start = window_start()
             state = load_state(env)
-            wh, est, new = adax_energy(
+            wh, est, new, incomplete = adax_energy(
                 env, token, [r["id"] for r in content.get("rooms", [])],
                 start, now_ms, state)
             try:
@@ -312,7 +336,8 @@ def run_once(env, dry=False):
                 errors.append(f"Spotpris otillgängligt ({e})")
                 price, note = parse_price(
                     env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
-            energy = energy_line(wh, price, start, note=note, estimated=est)
+            energy = energy_line(wh, price, start, note=note, estimated=est,
+                                 incomplete=incomplete)
             if not dry:
                 try:
                     save_state(env, new)

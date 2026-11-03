@@ -144,3 +144,32 @@ def test_missing_spot_raises_instead_of_silent_none():
 
 def test_energy_line_flags_missing_price():
     assert o.energy_line(5200, None).endswith("(elpris ej inställt)")
+
+
+def test_covered_ms_detects_missing_day():
+    # Gårdagens dygn saknas: bara dagens dygn finns -> täckning = nu - dagens start.
+    pts = [{"fromTime": TODAY, "toTime": TODAY + D, "energyWh": 5}]
+    assert o.covered_ms(pts, START, NOW) == NOW - TODAY
+    full = pts + [{"fromTime": YEST, "toTime": TODAY, "energyWh": 5}]
+    assert o.covered_ms(full + full, START, NOW) == NOW - START  # dubbletter ok
+
+
+def test_energy_line_incomplete_wins_over_estimated():
+    line = o.energy_line(5200, 1.0, None, None, estimated=True, incomplete=True)
+    assert "OBS: Adax saknar data" in line and "uppskattat" not in line
+
+
+def test_user_agent_is_sent():
+    import urllib.request
+    seen = {}
+    class R:
+        def __enter__(s): return s
+        def __exit__(s, *a): pass
+        def read(s): return b"[]"
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = lambda req, timeout=0: (seen.update(ua=req.get_header("User-agent")), R())[1]
+    try:
+        o.http_json("https://example.org/x")
+    finally:
+        urllib.request.urlopen = orig
+    assert seen["ua"].startswith("tempwatch/")
