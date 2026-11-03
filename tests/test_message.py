@@ -59,7 +59,7 @@ def test_energy_line_with_and_without_price():
     start = int(dt.datetime(2026, 11, 2, 4, 0, tzinfo=o.TZ).timestamp() * 1000)
     assert o.energy_line(12345, 1.2, start, now) == \
         "Energi sedan igår 04:00: 12,3 kWh (≈ 14,81 kr)"
-    assert o.energy_line(12345, None, None, now) == "Energi: 12,3 kWh"
+    assert o.energy_line(12345, None, None, now) == "Energi: 12,3 kWh (elpris ej inställt)"
 
 
 def test_parse_price():
@@ -93,3 +93,20 @@ def test_spot_average_and_price(monkeypatch=None):
 
 def test_fixed_price_fallback():
     assert o.price_per_kwh({"ELECTRICITY_PRICE_SEK_PER_KWH": "1,8"}, 1, 2) == (1.8, None)
+
+
+def test_missing_spot_raises_instead_of_silent_none():
+    orig = o.http_json
+    o.http_json = lambda url, **k: []
+    try:
+        try:
+            o.price_per_kwh({"ELECTRICITY_AREA": "SE2"}, 1793674800000, 1793716591783)
+            assert False, "borde ha kastat"
+        except RuntimeError as e:
+            assert "SE2" in str(e)
+    finally:
+        o.http_json = orig
+
+
+def test_energy_line_flags_missing_price():
+    assert o.energy_line(5200, None).endswith("(elpris ej inställt)")

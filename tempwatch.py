@@ -137,6 +137,8 @@ def price_per_kwh(env, start_ms, now_ms):
     area = clean(env.get("ELECTRICITY_AREA") or "").upper()
     if area and start_ms:
         avg = spot_average(area, start_ms, now_ms)
+        if avg is None:
+            raise RuntimeError(f"inga spotpriser hittades för {area} i perioden")
         if avg is not None:
             addon = parse_price(env.get("ELECTRICITY_ADDON_SEK_PER_KWH")) or 0.0
             vat = parse_price(env.get("ELECTRICITY_VAT"))
@@ -183,6 +185,8 @@ def energy_line(wh, price, start_ms=None, now=None, note=None):
         line += f" (≈ {fmt_num(kwh * price, 2)} kr)"
     if note and price is not None:
         line += f"\n  Snittspot: {note}"
+    if price is None:
+        line += " (elpris ej inställt)"
     return line
 
 
@@ -293,13 +297,41 @@ def debug_energy(env):
         print(f"    nu_ms={int(now_ms)}")
 
 
+def debug_price(env):
+    """Visar vilka prisinställningar som lästs och vad spot-API:et ger."""
+    keys = ("ELECTRICITY_AREA", "ELECTRICITY_ADDON_SEK_PER_KWH",
+            "ELECTRICITY_VAT", "ELECTRICITY_PRICE_SEK_PER_KWH")
+    for k in keys:
+        print(f"{k} = {clean(env.get(k) or '')!r}")
+    area = clean(env.get("ELECTRICITY_AREA") or "").upper()
+    if not area:
+        print("ELECTRICITY_AREA saknas -> inget spotpris används")
+        return
+    now = dt.datetime.now(TZ)
+    url = (f"https://www.elprisetjustnu.se/api/v1/prices/"
+           f"{now.year}/{now:%m-%d}_{area}.json")
+    print("URL:", url)
+    rows = http_json(url)
+    print(f"antal rader: {len(rows)}")
+    for r in rows[:2] + rows[-1:]:
+        print("   ", r)
+    start = int(now.replace(hour=4, minute=0, second=0, microsecond=0)
+                .timestamp() * 1000)
+    print("pris/kWh inkl. moms (idag från 04:00):",
+          price_per_kwh(env, start, time.time() * 1000))
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--debug-price", action="store_true")
     ap.add_argument("--debug-energy", action="store_true")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     env = os.environ
+    if a.debug_price:
+        debug_price(env)
+        return
     if a.debug_energy:
         debug_energy(env)
         return
