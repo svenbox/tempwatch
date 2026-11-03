@@ -1,0 +1,13 @@
+# offerberg-temp
+Telegram-notis kl 07:30 varje morgon med ute-/innetemperatur (Ecowitt) och
+rum med värme på (Adax). Inga beroenden utöver Python 3.12.
+
+    cp .env.example /etc/offerberg/offerberg.env   # fyll i, chmod 640
+    docker compose up -d --build
+    docker compose run --rm offerberg-temp python offerberg_temp.py --dry-run
+
+Tester: `python -m pytest tests`
+
+Status: API-anropen mot Ecowitt/Adax/Telegram är skrivna efter dokumentation
+från minnet och **inte testade mot riktiga tjänster**. Styrning av element via
+prompt är inte byggd (avvaktar).

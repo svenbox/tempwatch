@@ -1,0 +1,8 @@
+services:
+  offerberg-temp:
+    build: .
+    image: offerberg-temp:local
+    container_name: offerberg-temp
+    restart: unless-stopped
+    env_file:
+      - /etc/offerberg/offerberg.env
