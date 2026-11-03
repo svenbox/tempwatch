@@ -314,7 +314,7 @@ def telegram_send(env, text):
 def run_once(env, dry=False):
     # Delfel ska inte stoppa notisen: visa vad som saknas.
     eco = rooms = energy = None
-    errors = []
+    errors, extra = [], []
     try:
         eco = ecowitt_temps(env)
     except Exception as e:
@@ -354,6 +354,17 @@ def run_once(env, dry=False):
                               "Dessa rum har värme på: okänt")
     else:
         msg = "\n".join([TITLE] + ([energy] if energy else []))
+    try:
+        now_ms = time.time() * 1000
+        rows = load_samples(env, now_ms)
+        f = parse_price(env.get("ANOMALY_FACTOR")) or 1.5
+        m = parse_price(env.get("ANOMALY_MIN_EXTRA_WH")) or 1000.0
+        anoms, hist = find_anomalies(rows, now_ms, f, m)
+        extra = anomaly_lines(anoms, hist, rows)
+    except Exception as e:
+        errors.append(f"Elementkontroll misslyckades ({e})")
+    if extra:
+        msg += "\n" + "\n".join(extra)
     if errors:
         msg += "\n⚠ " + "; ".join(errors)
     print(msg)
@@ -371,7 +382,8 @@ def samples_path(env):
 def sample_rows(content, now_ms):
     """En rad per element: tid, enhet, rum, Wh och Adax energyTime."""
     return [{"t": int(now_ms), "id": d.get("id"), "room": d.get("roomId"),
-             "wh": d.get("energyWh"), "et": d.get("energyTime")}
+             "name": d.get("name"), "wh": d.get("energyWh"),
+             "et": d.get("energyTime")}
             for d in content.get("devices", [])]
 
 
@@ -384,6 +396,104 @@ def sample_devices(env):
     with open(samples_path(env), "a") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
+
+
+DAY_MS = 24 * 3600 * 1000
+MIN_SAMPLES_PER_DAY = 48  # av max 96 (var 15:e minut); färre = för tunn data
+MIN_HISTORY_DAYS = 3
+
+
+def load_samples(env, now_ms, days=9):
+    """Läser devices.jsonl; hoppar över trasiga rader och dubbletter (id, et)."""
+    rows, seen = [], set()
+    try:
+        with open(samples_path(env)) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    key = (r["id"], r.get("et"))
+                    if r["t"] < now_ms - days * DAY_MS or key in seen:
+                        continue
+                    r["wh"] = float(r["wh"])
+                    seen.add(key)
+                    rows.append(r)
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return rows
+
+
+def window_stats(rows, lo, hi):
+    """{id: {n, wh_day, active}}. wh_day = medel Wh/timme * 24 (Wh per dygn)."""
+    by = {}
+    for r in rows:
+        if lo <= r["t"] < hi:
+            by.setdefault(r["id"], []).append(r["wh"])
+    return {i: {"n": len(v), "wh_day": sum(v) / len(v) * 24,
+                "active": sum(1 for x in v if x > 0) / len(v)}
+            for i, v in by.items()}
+
+
+def find_anomalies(rows, now_ms, factor=1.5, min_extra_wh=1000.0):
+    """Returnerar (avvikelser, antal dygn med historik).
+
+    Jämför senaste dygnet med elementets egen median de föregående dygnen,
+    och med övriga elements förändring (kalla dagar höjer alla)."""
+    import statistics as st
+    wins = [window_stats(rows, now_ms - (k + 1) * DAY_MS, now_ms - k * DAY_MS)
+            for k in range(8)]
+    ok = lambda w, i: i in w and w[i]["n"] >= MIN_SAMPLES_PER_DAY
+    history = sum(1 for w in wins[1:] if any(ok(w, i) for i in w))
+    today = {i: v for i, v in wins[0].items() if ok(wins[0], i)}
+    if history < MIN_HISTORY_DAYS or not today:
+        return [], history
+    base = {}
+    for i in today:
+        past = [w[i] for w in wins[1:] if ok(w, i)]
+        if len(past) >= MIN_HISTORY_DAYS:
+            base[i] = (st.median(x["wh_day"] for x in past),
+                       st.median(x["active"] for x in past))
+    if not base:
+        return [], history
+    ratio = {i: (today[i]["wh_day"] + 50) / (base[i][0] + 50) for i in base}
+    d_act = {i: today[i]["active"] - base[i][1] for i in base}
+    peer_ratio = max(1.0, st.median(ratio.values()))
+    peer_act = st.median(d_act.values())
+    out = []
+    for i in base:
+        extra = today[i]["wh_day"] - base[i][0]
+        high_energy = extra > min_extra_wh and ratio[i] > factor * peer_ratio
+        high_active = (today[i]["active"] >= 0.5
+                       and d_act[i] - peer_act >= 0.25)
+        if high_energy or high_active:
+            out.append({"id": i, "energy": high_energy, "active": high_active,
+                        "wh_day": today[i]["wh_day"], "base_wh": base[i][0],
+                        "act": today[i]["active"], "base_act": base[i][1]})
+    return out, history
+
+
+def anomaly_lines(anoms, history, rows):
+    names = {}
+    for r in rows:
+        if r.get("name"):
+            names[r["id"]] = r["name"]
+    if history < MIN_HISTORY_DAYS:
+        return [f"Elementkontroll: samlar data ({history}/{MIN_HISTORY_DAYS} dygn)"]
+    if not anoms:
+        return ["Elementkontroll: inga avvikelser"]
+    out = ["⚠ Avvikande element (senaste dygnet):"]
+    for a in anoms:
+        what = []
+        if a["energy"]:
+            what.append(f"{fmt_num(a['wh_day'] / 1000, 1)} kWh, normalt "
+                        f"{fmt_num(a['base_wh'] / 1000, 1)} kWh")
+        if a["active"]:
+            what.append(f"aktivt {a['act'] * 100:.0f} % av tiden, normalt "
+                        f"{a['base_act'] * 100:.0f} %")
+        out.append(f"  {names.get(a['id'], 'element ' + str(a['id']))}: "
+                   + "; ".join(what))
+    return out
 
 
 def seconds_until_next(now=None):

@@ -177,5 +177,60 @@ def test_user_agent_is_sent():
 
 def test_sample_rows():
     j = {"devices": [{"id": 1, "roomId": 9, "energyWh": 242, "energyTime": 5, "name": "x"}]}
-    assert o.sample_rows(j, 10.9) == [{"t": 10, "id": 1, "room": 9, "wh": 242, "et": 5}]
+    assert o.sample_rows(j, 10.9) == [{"t": 10, "id": 1, "room": 9, "name": "x", "wh": 242, "et": 5}]
     assert o.sample_rows({}, 1) == []
+
+
+def _rows(days, per_day_means, now, id_names=None):
+    """Syntetiska prover var 15:e minut i `days` dygn bakåt. per_day_means[k][id]
+    = (wh, andel_aktiva) för dygn k (0 = senaste)."""
+    rows = []
+    for k in range(days):
+        for j in range(96):
+            t = now - k * D - j * 15 * 60 * 1000 - 1000
+            for i, (wh, share) in per_day_means[k].items():
+                active = (j / 96) < share
+                rows.append({"t": t, "id": i, "et": t, "name": f"E{i}",
+                             "wh": wh if active else 0.0})
+    return rows
+
+
+def test_anomaly_flags_outlier_but_not_cold_day():
+    now = NOW
+    normal = {1: (100, 0.5), 2: (100, 0.5), 3: (100, 0.5)}
+    # Element 1 dubblar sin förbrukning, övriga oförändrade -> flaggas.
+    today = {1: (400, 0.9), 2: (100, 0.5), 3: (100, 0.5)}
+    rows = _rows(6, [today] + [normal] * 5, now)
+    anoms, hist = o.find_anomalies(rows, now)
+    assert hist == 5 and [a["id"] for a in anoms] == [1]
+    # Kall dag: alla tredubblar -> ingen sticker ut.
+    cold = {i: (300, 0.5) for i in (1, 2, 3)}
+    rows = _rows(6, [cold] + [normal] * 5, now)
+    assert o.find_anomalies(rows, now)[0] == []
+
+
+def test_anomaly_needs_history():
+    now = NOW
+    d = {1: (500, 1.0)}
+    anoms, hist = o.find_anomalies(_rows(2, [d, d], now), now)
+    assert anoms == [] and hist < 3
+    assert "samlar data" in o.anomaly_lines(anoms, hist, [])[0]
+
+
+def test_anomaly_lines_text():
+    a = {"id": 7, "energy": True, "active": True, "wh_day": 4100.0,
+         "base_wh": 1900.0, "act": 0.85, "base_act": 0.4}
+    lines = o.anomaly_lines([a], 5, [{"id": 7, "name": "Mot älven"}])
+    assert lines[0].startswith("⚠") and "Mot älven" in lines[1]
+    assert "4,1 kWh, normalt 1,9 kWh" in lines[1] and "85 %" in lines[1]
+
+
+def test_load_samples_skips_bad_and_dupes():
+    import tempfile, os, json
+    d = tempfile.mkdtemp()
+    env = {"TEMPWATCH_STATE": os.path.join(d, "s.json")}
+    ok = {"t": NOW, "id": 1, "et": 5, "wh": 3}
+    with open(os.path.join(d, "devices.jsonl"), "w") as f:
+        f.write(json.dumps(ok) + "\n" + "inte json\n" + json.dumps(ok) + "\n"
+                + json.dumps({"t": NOW, "id": 2, "et": 5, "wh": None}) + "\n")
+    assert len(o.load_samples(env, NOW + 1)) == 1
