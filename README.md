@@ -6,6 +6,8 @@ rum med värme på (Adax). Inga beroenden utöver Python 3.12.
     docker compose up -d --build
     docker compose run --rm tempwatch python tempwatch.py --dry-run
 
+Valfritt: sätt `ELECTRICITY_PRICE_SEK_PER_KWH` för kostnad (annars visas bara kWh).
+
 Tester: `python -m pytest tests`
 
 Status: API-anropen mot Ecowitt/Adax/Telegram är skrivna efter dokumentation

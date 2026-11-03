@@ -3,9 +3,9 @@
 
 Endast standardbibliotek. Konfiguration via miljövariabler (se .env.example).
 Körning:
-  python offerberg_temp.py --once      # skicka direkt en gång
-  python offerberg_temp.py --dry-run   # skriv ut meddelandet, skicka inte
-  python offerberg_temp.py             # loop: skickar varje dag kl 07:30
+  python tempwatch.py --once      # skicka direkt en gång
+  python tempwatch.py --dry-run   # skriv ut meddelandet, skicka inte
+  python tempwatch.py             # loop: skickar varje dag kl 07:30
 """
 import argparse
 import datetime as dt
@@ -57,17 +57,45 @@ def ecowitt_temps(env):
             float(d["indoor"]["temperature"]["value"]))
 
 
-def adax_rooms_heating(env):
-    """Returnerar [(rumsnamn, °C)] för rum där värme är på."""
-    tok = http_json(
-        "https://api-1.adax.no/client-api/auth/token",
+ADAX = "https://api-1.adax.no/client-api"
+
+
+def adax_token(env):
+    return http_json(
+        f"{ADAX}/auth/token",
         data={"grant_type": "password",
               "username": clean(env["ADAX_CLIENT_ID"]),
               "password": clean(env["ADAX_CLIENT_SECRET"])},
     )["access_token"]
-    j = http_json("https://api-1.adax.no/client-api/rest/v1/content/",
-                  headers={"Authorization": f"Bearer {tok}"})
-    return heating_rooms(j)
+
+
+def adax_content(token):
+    return http_json(f"{ADAX}/rest/v1/content/",
+                     headers={"Authorization": f"Bearer {token}"})
+
+
+def adax_energy_24h_wh(token, room_ids, now=None):
+    """Summerar energi (Wh) för alla rum de senaste 24 timmarna."""
+    now_ms = (now or time.time()) * 1000
+    total = 0.0
+    for rid in room_ids:
+        j = http_json(f"{ADAX}/rest/v1/energy_log/{rid}",
+                      headers={"Authorization": f"Bearer {token}"})
+        total += energy_last_24h(j.get("points", []), now_ms)
+    return total
+
+
+def energy_last_24h(points, now_ms):
+    """Wh från timpunkter som slutar inom de senaste 24 h."""
+    since = now_ms - 24 * 3600 * 1000
+    return sum(float(p["energyWh"]) for p in points
+               if since < int(p["toTime"]) <= now_ms)
+
+
+def parse_price(v):
+    """Pris per kWh i kr, t.ex. '1,25' eller '1.25'. None om inte angivet."""
+    v = clean(v or "").replace(",", ".")
+    return float(v) if v else None
 
 
 def heating_rooms(j):
@@ -81,10 +109,24 @@ def fmt(v):
     return f"{v:.1f}".replace(".", ",") + " °C"
 
 
-def build_message(outdoor, indoor, rooms):
+def fmt_num(v, dec):
+    return f"{v:.{dec}f}".replace(".", ",")
+
+
+def energy_line(wh, price):
+    kwh = wh / 1000
+    line = f"Energi senaste 24 h: {fmt_num(kwh, 1)} kWh"
+    if price is not None:
+        line += f" (≈ {fmt_num(kwh * price, 2)} kr)"
+    return line
+
+
+def build_message(outdoor, indoor, rooms, energy=None):
     lines = [TITLE, f"Utomhus: {fmt(outdoor)}", f"Inomhus: {fmt(indoor)}",
              "Dessa rum har värme på:"]
     lines += [f"  {n}: {fmt(t)}" for n, t in rooms] or ["  (inga)"]
+    if energy:
+        lines.append(energy)
     return "\n".join(lines)
 
 
@@ -122,22 +164,32 @@ def telegram_send(env, text):
 
 def run_once(env, dry=False):
     # Delfel ska inte stoppa notisen: visa vad som saknas.
-    parts, errors = {}, []
+    eco = rooms = energy = None
+    errors = []
     try:
-        parts["eco"] = ecowitt_temps(env)
+        eco = ecowitt_temps(env)
     except Exception as e:
         errors.append(f"Ecowitt otillgänglig ({e})")
     try:
-        parts["adax"] = adax_rooms_heating(env)
+        token = adax_token(env)
+        content = adax_content(token)
+        rooms = heating_rooms(content)
+        try:
+            wh = adax_energy_24h_wh(
+                token, [r["id"] for r in content.get("rooms", [])])
+            energy = energy_line(wh, parse_price(
+                env.get("ELECTRICITY_PRICE_SEK_PER_KWH")))
+        except Exception as e:
+            errors.append(f"Energi otillgänglig ({e})")
     except Exception as e:
         errors.append(f"Adax otillgänglig ({e})")
-    if "eco" in parts:
-        msg = build_message(*parts["eco"], parts.get("adax", []))
+    if eco:
+        msg = build_message(*eco, rooms or [], energy)
+        if rooms is None:
+            msg = msg.replace("Dessa rum har värme på:\n  (inga)",
+                              "Dessa rum har värme på: okänt")
     else:
-        msg = TITLE
-    if "adax" not in parts and "eco" in parts:
-        msg = msg.replace("Dessa rum har värme på:\n  (inga)",
-                          "Dessa rum har värme på: okänt")
+        msg = "\n".join([TITLE] + ([energy] if energy else []))
     if errors:
         msg += "\n⚠ " + "; ".join(errors)
     print(msg)

@@ -36,3 +36,29 @@ def test_telegram_html_bold_title_and_escape():
 def test_token_names():
     assert o.telegram_token({"TELEGRAM_TOKEN": " x "}) == "x"
     assert o.telegram_token({"TELEGRAM_BOT_TOKEN": "y"}) == "y"
+
+
+def test_energy_last_24h_filters_window():
+    now = 1_000_000_000_000
+    h = 3600 * 1000
+    pts = [{"toTime": now - 1 * h, "energyWh": "500"},
+           {"toTime": now - 23 * h, "energyWh": 250},
+           {"toTime": now - 25 * h, "energyWh": 9999},
+           {"toTime": now + h, "energyWh": 9999}]
+    assert o.energy_last_24h(pts, now) == 750
+
+
+def test_energy_line_with_and_without_price():
+    assert o.energy_line(12345, 1.2) == "Energi senaste 24 h: 12,3 kWh (≈ 14,81 kr)"
+    assert o.energy_line(12345, None) == "Energi senaste 24 h: 12,3 kWh"
+
+
+def test_parse_price():
+    assert o.parse_price("1,25") == 1.25
+    assert o.parse_price(' "2.5" ') == 2.5
+    assert o.parse_price("") is None and o.parse_price(None) is None
+
+
+def test_message_includes_energy():
+    m = o.build_message(1, 2, [], "Energi senaste 24 h: 1,0 kWh")
+    assert m.splitlines()[-1] == "Energi senaste 24 h: 1,0 kWh"
