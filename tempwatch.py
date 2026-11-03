@@ -74,33 +74,87 @@ def adax_content(token):
                      headers={"Authorization": f"Bearer {token}"})
 
 
-def adax_energy(token, room_ids, now=None):
-    """(Wh, tidigaste starttid i ms | None) över alla rum, senaste dygnen."""
-    now_ms = (now or time.time()) * 1000
-    total, start = 0.0, None
-    for rid in room_ids:
-        j = http_json(f"{ADAX}/rest/v1/energy_log/{rid}",
-                      headers={"Authorization": f"Bearer {token}"})
-        wh, st = energy_recent(j.get("points", []), now_ms)
-        total += wh
-        if st is not None:
-            start = st if start is None else min(start, st)
-    return total, start
+def adax_points(token, room_id):
+    j = http_json(f"{ADAX}/rest/v1/energy_log/{room_id}",
+                  headers={"Authorization": f"Bearer {token}"})
+    return j.get("points", [])
 
 
-def energy_recent(points, now_ms):
-    """Adax energy_log ger *dygnspunkter* (04:00-04:00). Summera de som
-    överlappar de senaste 24 h, utan dubbletter. Returnerar (Wh, första start)."""
-    since = now_ms - 24 * 3600 * 1000
-    seen, total, start = set(), 0.0, None
+def energy_since(points, start_ms, now_ms, snaps=()):
+    """Wh sedan start_ms ur Adax dygnspunkter (04:00-04:00).
+
+    Ett dygn som korsar start_ms räknas som (värde nu) - (värde vid start).
+    Värdet vid start tas från en sparad ögonblicksbild (exakt) annars från
+    en jämn fördelning över dygnet (uppskattning).
+    Returnerar (Wh, uppskattat, nuvarande dygnspunkt eller None)."""
+    seen, total, estimated, current = set(), 0.0, False, None
     for p in points:
-        f, t = int(p["fromTime"]), int(p["toTime"])
-        if t <= since or f >= now_ms or (f, t) in seen:
+        f, t, wh = int(p["fromTime"]), int(p["toTime"]), float(p["energyWh"])
+        if (f, t) in seen:
             continue
         seen.add((f, t))
-        total += float(p["energyWh"])
-        start = f if start is None else min(start, f)
-    return total, start
+        if f <= now_ms < t:
+            current = {"from": f, "wh": wh}
+        if t <= start_ms or f >= now_ms:
+            continue
+        if f >= start_ms:
+            total += wh
+            continue
+        # Dygnet korsar starttiden.
+        near = [x for x in snaps if x["from"] == f
+                and abs(x["at"] - start_ms) <= 90 * 60 * 1000]
+        if near:
+            at_start = min(near, key=lambda x: abs(x["at"] - start_ms))["wh"]
+        else:
+            elapsed = min(t, now_ms) - f
+            at_start = wh * (start_ms - f) / elapsed if elapsed > 0 else 0.0
+            estimated = True
+        total += max(wh - at_start, 0.0)
+    return total, estimated, current
+
+
+def window_start(now=None):
+    """Igår kl 07:30 lokal tid (ms)."""
+    now = now or dt.datetime.now(TZ)
+    y = (now - dt.timedelta(days=1)).replace(
+        hour=SEND_AT.hour, minute=SEND_AT.minute, second=0, microsecond=0)
+    return int(y.timestamp() * 1000)
+
+
+def state_path(env):
+    return clean(env.get("TEMPWATCH_STATE") or "/state/snapshots.json")
+
+
+def load_state(env):
+    try:
+        with open(state_path(env)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(env, state):
+    path = state_path(env)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def adax_energy(env, token, room_ids, start_ms, now_ms, state):
+    """(Wh, uppskattat, nya ögonblicksbilder {rum: [...]})."""
+    total, est, new = 0.0, False, {}
+    cutoff = now_ms - 4 * 86400 * 1000
+    for rid in room_ids:
+        key = str(rid)
+        snaps = [x for x in state.get(key, []) if x["at"] > cutoff]
+        wh, e, cur = energy_since(adax_points(token, rid), start_ms, now_ms, snaps)
+        total += wh
+        est = est or e
+        if cur:
+            snaps.append({"at": int(now_ms), **cur})
+        new[key] = snaps
+    return total, est, new
 
 
 def spot_average(area, start_ms, now_ms):
@@ -177,12 +231,14 @@ def since_label(start_ms, now=None):
     return f"{day} {st:%H:%M}"
 
 
-def energy_line(wh, price, start_ms=None, now=None, note=None):
+def energy_line(wh, price, start_ms=None, now=None, note=None, estimated=False):
     kwh = wh / 1000
     since = f" sedan {since_label(start_ms, now)}" if start_ms else ""
-    line = f"Energi{since}: {fmt_num(kwh, 1)} kWh"
+    line = f"Energiförbrukning{since}: {fmt_num(kwh, 1)} kWh"
     if price is not None:
         line += f" (≈ {fmt_num(kwh * price, 2)} kr)"
+    if estimated:
+        line += " – uppskattat"
     if note and price is not None:
         line += f"\n  Snittspot: {note}"
     if price is None:
@@ -244,15 +300,24 @@ def run_once(env, dry=False):
         content = adax_content(token)
         rooms = heating_rooms(content)
         try:
-            wh, start = adax_energy(
-                token, [r["id"] for r in content.get("rooms", [])])
+            now_ms = time.time() * 1000
+            start = window_start()
+            state = load_state(env)
+            wh, est, new = adax_energy(
+                env, token, [r["id"] for r in content.get("rooms", [])],
+                start, now_ms, state)
             try:
-                price, note = price_per_kwh(env, start, time.time() * 1000)
+                price, note = price_per_kwh(env, start, now_ms)
             except Exception as e:
                 errors.append(f"Spotpris otillgängligt ({e})")
                 price, note = parse_price(
                     env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
-            energy = energy_line(wh, price, start, note=note)
+            energy = energy_line(wh, price, start, note=note, estimated=est)
+            if not dry:
+                try:
+                    save_state(env, new)
+                except OSError as e:
+                    errors.append(f"Kan inte spara tillstånd ({e})")
         except Exception as e:
             errors.append(f"Energi otillgänglig ({e})")
     except Exception as e:
@@ -285,16 +350,16 @@ def debug_energy(env):
     """Skriver ut Adax rå energy_log (utan hemligheter) för felsökning."""
     token = adax_token(env)
     now_ms = time.time() * 1000
+    start = window_start()
+    state = load_state(env)
     for r in adax_content(token).get("rooms", []):
-        j = http_json(f"{ADAX}/rest/v1/energy_log/{r['id']}",
-                      headers={"Authorization": f"Bearer {token}"})
-        pts = j.get("points", [])
-        print(f"{r['name']} (id {r['id']}): nycklar={sorted(j)} "
-              f"antal_punkter={len(pts)} "
-              f"summa_Wh_start={energy_recent(pts, now_ms)}")
+        pts = adax_points(token, r["id"])
+        res = energy_since(pts, start, now_ms, state.get(str(r["id"]), []))
+        print(f"{r['name']} (id {r['id']}): punkter={len(pts)} "
+              f"sedan_start_Wh={res[0]:.0f} uppskattat={res[1]} nu={res[2]}")
         for p in (pts[:2] + pts[-2:]) if pts else []:
             print("   ", p)
-        print(f"    nu_ms={int(now_ms)}")
+    print(f"start_ms={start} nu_ms={int(now_ms)} tillstånd={state_path(env)}")
 
 
 def debug_price(env):

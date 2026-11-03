@@ -6,3 +6,6 @@ services:
     restart: unless-stopped
     env_file:
       - /etc/tempwatch/tempwatch.env
+    volumes:
+      # Sparar dagens energi-delsumma så att "sedan igår 07:30" blir exakt.
+      - /var/lib/tempwatch:/state

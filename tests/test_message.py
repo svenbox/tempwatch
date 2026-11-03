@@ -38,28 +38,62 @@ def test_token_names():
     assert o.telegram_token({"TELEGRAM_BOT_TOKEN": "y"}) == "y"
 
 
-def test_energy_recent_uses_overlapping_daily_buckets_without_duplicates():
-    now = 1793716591783  # tis 2026-11-03 15:36
-    d = 86400000
-    today = 1793674800000  # tis 04:00
-    pts = [{"fromTime": today - 2 * d, "toTime": today - d, "energyWh": 9999},  # för gammal
-           {"fromTime": today - d, "toTime": today, "energyWh": 4000},
-           {"fromTime": today, "toTime": today + d, "energyWh": 1000},
-           {"fromTime": today, "toTime": today + d, "energyWh": 1000}]       # dubblett
-    assert o.energy_recent(pts, now) == (5000.0, today - d)
+H = 3600 * 1000
+D = 24 * H
+# tis 2026-11-03, dygnet börjar kl 04:00 (03:00 UTC), nu = 07:30 lokal tid.
+TODAY = 1793674800000
+NOW = TODAY + int(3.5 * H)
+START = NOW - D  # igår 07:30
+YEST = TODAY - D
 
 
-def test_energy_recent_empty():
-    assert o.energy_recent([], 1) == (0.0, None)
+def test_energy_since_exact_with_snapshot():
+    pts = [{"fromTime": YEST, "toTime": TODAY, "energyWh": 24000},
+           {"fromTime": TODAY, "toTime": TODAY + D, "energyWh": 700},
+           {"fromTime": TODAY, "toTime": TODAY + D, "energyWh": 700}]  # dubblett
+    snaps = [{"at": START + 60000, "from": YEST, "wh": 3000}]
+    wh, est, cur = o.energy_since(pts, START, NOW, snaps)
+    assert (wh, est) == (24000 - 3000 + 700, False)
+    assert cur == {"from": TODAY, "wh": 700}
+
+
+def test_energy_since_estimates_without_snapshot():
+    pts = [{"fromTime": YEST, "toTime": TODAY, "energyWh": 24000},
+           {"fromTime": TODAY, "toTime": TODAY + D, "energyWh": 700}]
+    wh, est, _ = o.energy_since(pts, START, NOW)
+    assert est is True and abs(wh - (24000 - 3500 + 700)) < 1e-6
+
+
+def test_energy_since_ignores_old_and_empty():
+    old = [{"fromTime": YEST - D, "toTime": YEST, "energyWh": 9999}]
+    assert o.energy_since(old, START, NOW) == (0.0, False, None)
+    assert o.energy_since([], START, NOW) == (0.0, False, None)
+
+
+def test_window_start_is_yesterday_0730():
+    import datetime as dt
+    now = dt.datetime(2026, 11, 3, 7, 30, tzinfo=o.TZ)
+    got = dt.datetime.fromtimestamp(o.window_start(now) / 1000, o.TZ)
+    assert (got.day, got.hour, got.minute) == (2, 7, 30)
+
+
+def test_state_roundtrip():
+    import tempfile, os
+    env = {"TEMPWATCH_STATE": os.path.join(tempfile.mkdtemp(), "s.json")}
+    assert o.load_state(env) == {}
+    o.save_state(env, {"1": [{"at": 1, "from": 2, "wh": 3}]})
+    assert o.load_state(env) == {"1": [{"at": 1, "from": 2, "wh": 3}]}
 
 
 def test_energy_line_with_and_without_price():
     import datetime as dt
     now = dt.datetime(2026, 11, 3, 7, 30, tzinfo=o.TZ)
-    start = int(dt.datetime(2026, 11, 2, 4, 0, tzinfo=o.TZ).timestamp() * 1000)
+    start = int(dt.datetime(2026, 11, 2, 7, 30, tzinfo=o.TZ).timestamp() * 1000)
     assert o.energy_line(12345, 1.2, start, now) == \
-        "Energi sedan igår 04:00: 12,3 kWh (≈ 14,81 kr)"
-    assert o.energy_line(12345, None, None, now) == "Energi: 12,3 kWh (elpris ej inställt)"
+        "Energiförbrukning sedan igår 07:30: 12,3 kWh (≈ 14,81 kr)"
+    assert o.energy_line(12345, 1.2, start, now, estimated=True).endswith("– uppskattat")
+    assert o.energy_line(12345, None, None, now) == \
+        "Energiförbrukning: 12,3 kWh (elpris ej inställt)"
 
 
 def test_parse_price():
