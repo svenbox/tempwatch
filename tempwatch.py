@@ -387,6 +387,21 @@ def debug_energy(env):
     print(f"start_ms={start} nu_ms={int(now_ms)} tillstånd={state_path(env)}")
 
 
+def debug_devices(env):
+    """Visar råsvaret från /content/?withEnergy=1 (enheter och timenergi)."""
+    token = adax_token(env)
+    j = http_json(f"{ADAX}/rest/v1/content/?withEnergy=1",
+                  headers={"Authorization": f"Bearer {token}"})
+    print("nycklar:", sorted(j))
+    now = time.time() * 1000
+    for d in j.get("devices", []):
+        et = d.get("energyTime")
+        age = f"{(now - int(et)) / 60000:.0f} min sedan" if et else "saknas"
+        print(f"  {d.get('name')} id={d.get('id')} energyWh={d.get('energyWh')} "
+              f"energyTime={et} ({age}) övriga={sorted(set(d) - {'name','id','energyWh','energyTime'})}")
+    print("rumsnycklar:", sorted({k for r in j.get("rooms", []) for k in r}))
+
+
 def debug_price(env):
     """Visar vilka prisinställningar som lästs och vad spot-API:et ger."""
     keys = ("ELECTRICITY_AREA", "ELECTRICITY_ADDON_SEK_PER_KWH",
@@ -414,11 +429,15 @@ def debug_price(env):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--debug-price", action="store_true")
+    ap.add_argument("--debug-devices", action="store_true")
     ap.add_argument("--debug-energy", action="store_true")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     env = os.environ
+    if a.debug_devices:
+        debug_devices(env)
+        return
     if a.debug_price:
         debug_price(env)
         return
