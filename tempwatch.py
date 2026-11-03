@@ -103,6 +103,49 @@ def energy_recent(points, now_ms):
     return total, start
 
 
+def spot_average(area, start_ms, now_ms):
+    """Medelspotpris (kr/kWh, exkl. moms) för elområdet över perioden.
+
+    Källa: elprisetjustnu.se (öppet API, ingen nyckel). Obevakat medelvärde
+    över alla timmar/kvartar i perioden; saknade dagar hoppas över."""
+    start = dt.datetime.fromtimestamp(start_ms / 1000, TZ)
+    end = dt.datetime.fromtimestamp(now_ms / 1000, TZ)
+    vals, day = [], start.date()
+    while day <= end.date():
+        url = (f"https://www.elprisetjustnu.se/api/v1/prices/"
+               f"{day.year}/{day:%m-%d}_{area}.json")
+        try:
+            rows = http_json(url)
+        except RuntimeError as e:
+            if "HTTP 404" not in str(e):
+                raise
+            rows = []
+        for r in rows:
+            t = dt.datetime.fromisoformat(r["time_start"])
+            if start <= t < end:
+                vals.append(float(r["SEK_per_kWh"]))
+        day += dt.timedelta(days=1)
+    return sum(vals) / len(vals) if vals else None
+
+
+def price_per_kwh(env, start_ms, now_ms):
+    """(pris kr/kWh inkl. moms | None, anteckning).
+
+    Med ELECTRICITY_AREA (t.ex. SE4): medelspot + ELECTRICITY_ADDON_SEK_PER_KWH
+    (nät, skatt, påslag; exkl. moms) + moms (ELECTRICITY_VAT, standard 0,25).
+    Annars fast ELECTRICITY_PRICE_SEK_PER_KWH."""
+    area = clean(env.get("ELECTRICITY_AREA") or "").upper()
+    if area and start_ms:
+        avg = spot_average(area, start_ms, now_ms)
+        if avg is not None:
+            addon = parse_price(env.get("ELECTRICITY_ADDON_SEK_PER_KWH")) or 0.0
+            vat = parse_price(env.get("ELECTRICITY_VAT"))
+            vat = 0.25 if vat is None else vat
+            price = (avg + addon) * (1 + vat)
+            return price, f"{fmt_num(avg, 2)} kr/kWh spot {area}, exkl. moms"
+    return parse_price(env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
+
+
 def parse_price(v):
     """Pris per kWh i kr, t.ex. '1,25' eller '1.25'. None om inte angivet."""
     v = clean(v or "").replace(",", ".")
@@ -132,12 +175,14 @@ def since_label(start_ms, now=None):
     return f"{day} {st:%H:%M}"
 
 
-def energy_line(wh, price, start_ms=None, now=None):
+def energy_line(wh, price, start_ms=None, now=None, note=None):
     kwh = wh / 1000
     since = f" sedan {since_label(start_ms, now)}" if start_ms else ""
     line = f"Energi{since}: {fmt_num(kwh, 1)} kWh"
     if price is not None:
         line += f" (≈ {fmt_num(kwh * price, 2)} kr)"
+    if note and price is not None:
+        line += f"\n  Snittspot: {note}"
     return line
 
 
@@ -197,8 +242,13 @@ def run_once(env, dry=False):
         try:
             wh, start = adax_energy(
                 token, [r["id"] for r in content.get("rooms", [])])
-            energy = energy_line(wh, parse_price(
-                env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), start)
+            try:
+                price, note = price_per_kwh(env, start, time.time() * 1000)
+            except Exception as e:
+                errors.append(f"Spotpris otillgängligt ({e})")
+                price, note = parse_price(
+                    env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
+            energy = energy_line(wh, price, start, note=note)
         except Exception as e:
             errors.append(f"Energi otillgänglig ({e})")
     except Exception as e:

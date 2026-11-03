@@ -71,3 +71,25 @@ def test_parse_price():
 def test_message_includes_energy():
     m = o.build_message(1, 2, [], "Energi: 1,0 kWh")
     assert m.splitlines()[-1] == "Energi: 1,0 kWh"
+
+
+def test_spot_average_and_price(monkeypatch=None):
+    import datetime as dt
+    rows = [{"time_start": "2026-11-03T05:00:00+01:00", "SEK_per_kWh": 0.40},
+            {"time_start": "2026-11-03T06:00:00+01:00", "SEK_per_kWh": 0.60},
+            {"time_start": "2026-11-03T23:00:00+01:00", "SEK_per_kWh": 9.00}]  # efter slutet
+    orig = o.http_json
+    o.http_json = lambda url, **k: rows
+    try:
+        start = int(dt.datetime(2026, 11, 3, 4, 0, tzinfo=o.TZ).timestamp() * 1000)
+        now = int(dt.datetime(2026, 11, 3, 7, 30, tzinfo=o.TZ).timestamp() * 1000)
+        assert abs(o.spot_average("SE4", start, now) - 0.5) < 1e-9
+        price, note = o.price_per_kwh(
+            {"ELECTRICITY_AREA": "se4", "ELECTRICITY_ADDON_SEK_PER_KWH": "0,50"}, start, now)
+        assert abs(price - (0.5 + 0.5) * 1.25) < 1e-9 and "SE4" in note
+    finally:
+        o.http_json = orig
+
+
+def test_fixed_price_fallback():
+    assert o.price_per_kwh({"ELECTRICITY_PRICE_SEK_PER_KWH": "1,8"}, 1, 2) == (1.8, None)
