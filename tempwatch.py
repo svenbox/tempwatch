@@ -74,22 +74,33 @@ def adax_content(token):
                      headers={"Authorization": f"Bearer {token}"})
 
 
-def adax_energy_24h_wh(token, room_ids, now=None):
-    """Summerar energi (Wh) för alla rum de senaste 24 timmarna."""
+def adax_energy(token, room_ids, now=None):
+    """(Wh, tidigaste starttid i ms | None) över alla rum, senaste dygnen."""
     now_ms = (now or time.time()) * 1000
-    total = 0.0
+    total, start = 0.0, None
     for rid in room_ids:
         j = http_json(f"{ADAX}/rest/v1/energy_log/{rid}",
                       headers={"Authorization": f"Bearer {token}"})
-        total += energy_last_24h(j.get("points", []), now_ms)
-    return total
+        wh, st = energy_recent(j.get("points", []), now_ms)
+        total += wh
+        if st is not None:
+            start = st if start is None else min(start, st)
+    return total, start
 
 
-def energy_last_24h(points, now_ms):
-    """Wh från timpunkter som slutar inom de senaste 24 h."""
+def energy_recent(points, now_ms):
+    """Adax energy_log ger *dygnspunkter* (04:00-04:00). Summera de som
+    överlappar de senaste 24 h, utan dubbletter. Returnerar (Wh, första start)."""
     since = now_ms - 24 * 3600 * 1000
-    return sum(float(p["energyWh"]) for p in points
-               if since < int(p["toTime"]) <= now_ms)
+    seen, total, start = set(), 0.0, None
+    for p in points:
+        f, t = int(p["fromTime"]), int(p["toTime"])
+        if t <= since or f >= now_ms or (f, t) in seen:
+            continue
+        seen.add((f, t))
+        total += float(p["energyWh"])
+        start = f if start is None else min(start, f)
+    return total, start
 
 
 def parse_price(v):
@@ -113,9 +124,18 @@ def fmt_num(v, dec):
     return f"{v:.{dec}f}".replace(".", ",")
 
 
-def energy_line(wh, price):
+def since_label(start_ms, now=None):
+    """'igår 04:00' / 'idag 04:00' i lokal tid."""
+    now = now or dt.datetime.now(TZ)
+    st = dt.datetime.fromtimestamp(start_ms / 1000, TZ)
+    day = "idag" if st.date() == now.date() else "igår"
+    return f"{day} {st:%H:%M}"
+
+
+def energy_line(wh, price, start_ms=None, now=None):
     kwh = wh / 1000
-    line = f"Energi senaste 24 h: {fmt_num(kwh, 1)} kWh"
+    since = f" sedan {since_label(start_ms, now)}" if start_ms else ""
+    line = f"Energi{since}: {fmt_num(kwh, 1)} kWh"
     if price is not None:
         line += f" (≈ {fmt_num(kwh * price, 2)} kr)"
     return line
@@ -175,10 +195,10 @@ def run_once(env, dry=False):
         content = adax_content(token)
         rooms = heating_rooms(content)
         try:
-            wh = adax_energy_24h_wh(
+            wh, start = adax_energy(
                 token, [r["id"] for r in content.get("rooms", [])])
             energy = energy_line(wh, parse_price(
-                env.get("ELECTRICITY_PRICE_SEK_PER_KWH")))
+                env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), start)
         except Exception as e:
             errors.append(f"Energi otillgänglig ({e})")
     except Exception as e:
@@ -217,7 +237,7 @@ def debug_energy(env):
         pts = j.get("points", [])
         print(f"{r['name']} (id {r['id']}): nycklar={sorted(j)} "
               f"antal_punkter={len(pts)} "
-              f"summa_24h_Wh={energy_last_24h(pts, now_ms)}")
+              f"summa_Wh_start={energy_recent(pts, now_ms)}")
         for p in (pts[:2] + pts[-2:]) if pts else []:
             print("   ", p)
         print(f"    nu_ms={int(now_ms)}")

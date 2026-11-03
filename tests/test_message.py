@@ -38,19 +38,28 @@ def test_token_names():
     assert o.telegram_token({"TELEGRAM_BOT_TOKEN": "y"}) == "y"
 
 
-def test_energy_last_24h_filters_window():
-    now = 1_000_000_000_000
-    h = 3600 * 1000
-    pts = [{"toTime": now - 1 * h, "energyWh": "500"},
-           {"toTime": now - 23 * h, "energyWh": 250},
-           {"toTime": now - 25 * h, "energyWh": 9999},
-           {"toTime": now + h, "energyWh": 9999}]
-    assert o.energy_last_24h(pts, now) == 750
+def test_energy_recent_uses_overlapping_daily_buckets_without_duplicates():
+    now = 1793716591783  # tis 2026-11-03 15:36
+    d = 86400000
+    today = 1793674800000  # tis 04:00
+    pts = [{"fromTime": today - 2 * d, "toTime": today - d, "energyWh": 9999},  # för gammal
+           {"fromTime": today - d, "toTime": today, "energyWh": 4000},
+           {"fromTime": today, "toTime": today + d, "energyWh": 1000},
+           {"fromTime": today, "toTime": today + d, "energyWh": 1000}]       # dubblett
+    assert o.energy_recent(pts, now) == (5000.0, today - d)
+
+
+def test_energy_recent_empty():
+    assert o.energy_recent([], 1) == (0.0, None)
 
 
 def test_energy_line_with_and_without_price():
-    assert o.energy_line(12345, 1.2) == "Energi senaste 24 h: 12,3 kWh (≈ 14,81 kr)"
-    assert o.energy_line(12345, None) == "Energi senaste 24 h: 12,3 kWh"
+    import datetime as dt
+    now = dt.datetime(2026, 11, 3, 7, 30, tzinfo=o.TZ)
+    start = int(dt.datetime(2026, 11, 2, 4, 0, tzinfo=o.TZ).timestamp() * 1000)
+    assert o.energy_line(12345, 1.2, start, now) == \
+        "Energi sedan igår 04:00: 12,3 kWh (≈ 14,81 kr)"
+    assert o.energy_line(12345, None, None, now) == "Energi: 12,3 kWh"
 
 
 def test_parse_price():
@@ -60,5 +69,5 @@ def test_parse_price():
 
 
 def test_message_includes_energy():
-    m = o.build_message(1, 2, [], "Energi senaste 24 h: 1,0 kWh")
-    assert m.splitlines()[-1] == "Energi senaste 24 h: 1,0 kWh"
+    m = o.build_message(1, 2, [], "Energi: 1,0 kWh")
+    assert m.splitlines()[-1] == "Energi: 1,0 kWh"
