@@ -207,12 +207,32 @@ def seconds_until_next(now=None):
     return (nxt - now).total_seconds()
 
 
+def debug_energy(env):
+    """Skriver ut Adax rå energy_log (utan hemligheter) för felsökning."""
+    token = adax_token(env)
+    now_ms = time.time() * 1000
+    for r in adax_content(token).get("rooms", []):
+        j = http_json(f"{ADAX}/rest/v1/energy_log/{r['id']}",
+                      headers={"Authorization": f"Bearer {token}"})
+        pts = j.get("points", [])
+        print(f"{r['name']} (id {r['id']}): nycklar={sorted(j)} "
+              f"antal_punkter={len(pts)} "
+              f"summa_24h_Wh={energy_last_24h(pts, now_ms)}")
+        for p in (pts[:2] + pts[-2:]) if pts else []:
+            print("   ", p)
+        print(f"    nu_ms={int(now_ms)}")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--debug-energy", action="store_true")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     env = os.environ
+    if a.debug_energy:
+        debug_energy(env)
+        return
     if a.once or a.dry_run:
         run_once(env, dry=a.dry_run)
         return
