@@ -1,10 +1,10 @@
-# offerberg-temp
+# tempwatch
 Telegram-notis kl 07:30 varje morgon med ute-/innetemperatur (Ecowitt) och
 rum med värme på (Adax). Inga beroenden utöver Python 3.12.
 
-    cp .env.example /etc/offerberg/offerberg.env   # fyll i, chmod 640
+    cp .env.example /etc/tempwatch/tempwatch.env   # fyll i, chmod 640
     docker compose up -d --build
-    docker compose run --rm offerberg-temp python offerberg_temp.py --dry-run
+    docker compose run --rm tempwatch python tempwatch.py --dry-run
 
 Tester: `python -m pytest tests`
 

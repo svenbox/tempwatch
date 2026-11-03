@@ -1,8 +1,8 @@
 services:
-  offerberg-temp:
+  tempwatch:
     build: .
-    image: offerberg-temp:local
-    container_name: offerberg-temp
+    image: tempwatch:local
+    container_name: tempwatch
     restart: unless-stopped
     env_file:
-      - /etc/offerberg/offerberg.env
+      - /etc/tempwatch/tempwatch.env

@@ -1,5 +1,5 @@
 import datetime as dt
-import offerberg_temp as o
+import tempwatch as o
 
 
 def test_message_format():
