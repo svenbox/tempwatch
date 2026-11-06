@@ -3,10 +3,12 @@ import tempwatch as o
 
 
 def test_message_format():
-    m = o.build_message(3.04, 21.5, [("Vardagsrum", 20.99), ("Sovrum", 18.0)])
+    m = o.build_message(3.04, 21.5, [("Kök", 10.4, 10.0), ("Sovrum", 18.0, 17.5),
+                                     ("Hall", 12.0, None)])
     assert m.splitlines() == [
         "Offerberg temp", "Utomhus: 3,0 °C", "Inomhus (köket): 21,5 °C",
-        "Dessa rum har värme på:", "  Vardagsrum: 21,0 °C", "  Sovrum: 18,0 °C"]
+        "Dessa rum har värme på:", "  Kök: 10,4 °C (mål 10 °C)",
+        "  Sovrum: 18,0 °C (mål 17,5 °C)", "  Hall: 12,0 °C"]
 
 
 def test_no_rooms():
@@ -23,10 +25,11 @@ def test_next_run_before_and_after_0730():
 
 def test_heating_rooms():
     j = {"rooms": [
-        {"name": "A", "heatingEnabled": True, "temperature": 2150},
+        {"name": "A", "heatingEnabled": True, "temperature": 2150,
+         "targetTemperature": 2100},
         {"name": "B", "heatingEnabled": False, "temperature": 1800},
         {"name": "C", "heatingEnabled": True}]}
-    assert o.heating_rooms(j) == [("A", 21.5)]
+    assert o.heating_rooms(j) == [("A", 21.5, 21.0)]
 
 
 def test_telegram_html_bold_title_and_escape():
@@ -154,10 +157,10 @@ def test_covered_ms_detects_missing_day():
     assert o.covered_ms(full + full, START, NOW) == NOW - START  # dubbletter ok
 
 
-def test_energy_line_incomplete_wins_over_estimated():
-    line = o.energy_line(5200, 1.0, None, None, estimated=True, incomplete=True)
-    assert "OBS: Adax saknar data" in line and "uppskattat" not in line
-
+def test_energy_line_has_no_obs_text():
+    line = o.energy_line(5200, 1.0, None, None, estimated=False)
+    assert "OBS" not in line
+    assert o.energy_line(5200, 1.0, None, None, estimated=True).endswith("– uppskattat")
 
 def test_user_agent_is_sent():
     import urllib.request

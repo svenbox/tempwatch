@@ -231,13 +231,25 @@ def parse_price(v):
 
 def heating_rooms(j):
     """Rum med värme på. Adax anger temperaturer som heltal gånger 100."""
-    return [(r["name"], r["temperature"] / 100)
+    return [(r["name"], r["temperature"] / 100,
+             r["targetTemperature"] / 100 if "targetTemperature" in r else None)
             for r in j.get("rooms", [])
             if r.get("heatingEnabled") and "temperature" in r]
 
 
 def fmt(v):
     return f"{v:.1f}".replace(".", ",") + " °C"
+
+
+def fmt_target(v):
+    """Måltemperatur utan onödig decimal: 10 °C, 10,5 °C."""
+    return (f"{v:.0f}" if abs(v - round(v)) < 0.05
+            else f"{v:.1f}".replace(".", ",")) + " °C"
+
+
+def room_line(name, temp, target=None):
+    line = f"  {name}: {fmt(temp)}"
+    return line + (f" (mål {fmt_target(target)})" if target is not None else "")
 
 
 def fmt_num(v, dec):
@@ -253,15 +265,13 @@ def since_label(start_ms, now=None):
 
 
 def energy_line(wh, price, start_ms=None, now=None, note=None,
-                estimated=False, incomplete=False):
+                estimated=False):
     kwh = wh / 1000
     since = f" sedan {since_label(start_ms, now)}" if start_ms else ""
     line = f"Energiförbrukning{since}: {fmt_num(kwh, 1)} kWh"
     if price is not None:
         line += f" (≈ {fmt_num(kwh * price, 2)} kr)"
-    if incomplete:
-        line += " – OBS: Adax saknar data för delar av perioden"
-    elif estimated:
+    if estimated:
         line += " – uppskattat"
     if price is None:
         line += " (elpris ej inställt)"
@@ -271,7 +281,7 @@ def energy_line(wh, price, start_ms=None, now=None, note=None,
 def build_message(outdoor, indoor, rooms, energy=None):
     lines = [TITLE, f"Utomhus: {fmt(outdoor)}", f"Inomhus (köket): {fmt(indoor)}",
              "Dessa rum har värme på:"]
-    lines += [f"  {n}: {fmt(t)}" for n, t in rooms] or ["  (inga)"]
+    lines += [room_line(*r) for r in rooms] or ["  (inga)"]
     if energy:
         lines.append(energy)
     return "\n".join(lines)
@@ -325,7 +335,7 @@ def run_once(env, dry=False):
             now_ms = time.time() * 1000
             start = window_start()
             state = load_state(env)
-            wh, est, new, incomplete = adax_energy(
+            wh, est, new, _ = adax_energy(
                 env, token, [r["id"] for r in content.get("rooms", [])],
                 start, now_ms, state)
             try:
@@ -334,8 +344,7 @@ def run_once(env, dry=False):
                 errors.append(f"Spotpris otillgängligt ({e})")
                 price, note = parse_price(
                     env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
-            energy = energy_line(wh, price, start, note=note, estimated=est,
-                                 incomplete=incomplete)
+            energy = energy_line(wh, price, start, note=note, estimated=est)
             if not dry:
                 try:
                     save_state(env, new)
