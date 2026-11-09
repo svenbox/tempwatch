@@ -25,16 +25,26 @@ TITLE = "Offerberg temp"
 USER_AGENT = "tempwatch/1.0 (+https://github.com/svenbox/tempwatch)"
 
 
-def http_json(url, data=None, headers=None, timeout=20):
+def http_json(url, data=None, headers=None, timeout=20, retries=2):
+    """JSON-anrop. Försöker om vid serverfel (5xx) och nätverksfel."""
     body = urllib.parse.urlencode(data).encode() if data is not None else None
     hdrs = {"User-Agent": USER_AGENT, **(headers or {})}
-    req = urllib.request.Request(url, data=body, headers=hdrs)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:300]
-        raise RuntimeError(f"HTTP {e.code} {detail}") from None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=body, headers=hdrs)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            if e.code >= 500 and attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"HTTP {e.code} {detail}") from None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"nätverksfel: {e}") from None
 
 
 def clean(v):
@@ -366,7 +376,8 @@ def run_once(env, dry=False):
         rows = load_samples(env, now_ms)
         f = parse_price(env.get("ANOMALY_FACTOR")) or 1.5
         m = parse_price(env.get("ANOMALY_MIN_EXTRA_WH")) or 1000.0
-        anoms, hist = find_anomalies(rows, now_ms, f, m)
+        mb = parse_price(env.get("ANOMALY_MIN_BASELINE_WH")) or 500.0
+        anoms, hist = find_anomalies(rows, now_ms, f, m, mb)
         extra = anomaly_lines(anoms, hist, rows)
     except Exception as e:
         errors.append(f"Elementkontroll misslyckades ({e})")
@@ -442,7 +453,8 @@ def window_stats(rows, lo, hi):
             for i, v in by.items()}
 
 
-def find_anomalies(rows, now_ms, factor=1.5, min_extra_wh=1000.0):
+def find_anomalies(rows, now_ms, factor=1.5, min_extra_wh=1000.0,
+                   min_base_wh=500.0):
     """Returnerar (avvikelser, antal dygn med historik).
 
     Jämför senaste dygnet med elementets egen median de föregående dygnen,
@@ -458,7 +470,10 @@ def find_anomalies(rows, now_ms, factor=1.5, min_extra_wh=1000.0):
     base = {}
     for i in today:
         past = [w[i] for w in wins[1:] if ok(w, i)]
-        if len(past) >= MIN_HISTORY_DAYS:
+        # Normalvärde nära noll (element som varit avstängda) går inte att
+        # jämföra mot: då är det ofta bara säsongsstart, inte ett fel.
+        if (len(past) >= MIN_HISTORY_DAYS
+                and st.median(x["wh_day"] for x in past) >= min_base_wh):
             base[i] = (st.median(x["wh_day"] for x in past),
                        st.median(x["active"] for x in past))
     if not base:

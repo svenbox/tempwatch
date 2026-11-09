@@ -241,3 +241,57 @@ def test_load_samples_skips_bad_and_dupes():
 
 def test_energy_line_has_no_spot_line():
     assert "Snittspot" not in o.energy_line(1000, 1.0, None, None, note="x")
+
+
+def test_idle_baseline_is_not_flagged_as_anomaly():
+    # Elementen var nästan avstängda i veckan före; nu börjar värmen -> inget fel.
+    now = NOW
+    idle = {1: (1, 0.1), 2: (1, 0.1), 3: (1, 0.1)}
+    winter = {1: (400, 0.9), 2: (500, 0.9), 3: (300, 0.98)}
+    rows = _rows(6, [winter] + [idle] * 5, now)
+    assert o.find_anomalies(rows, now)[0] == []
+
+
+def test_http_json_retries_5xx_then_succeeds():
+    import io, urllib.error, urllib.request
+    calls = {"n": 0}
+    class R:
+        def __enter__(s): return s
+        def __exit__(s, *a): pass
+        def read(s, *a): return b'{"ok": 1}'
+    def fake(req, timeout=0):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.HTTPError(req.full_url, 502, "bad", {}, io.BytesIO(b"boom"))
+        return R()
+    orig_open, orig_sleep = urllib.request.urlopen, o.time.sleep
+    urllib.request.urlopen, o.time.sleep = fake, lambda s: None
+    try:
+        assert o.http_json("https://example.org/x") == {"ok": 1}
+        assert calls["n"] == 3
+        calls["n"] = -10  # alltid 502
+        try:
+            o.http_json("https://example.org/x", retries=1)
+            assert False
+        except RuntimeError as e:
+            assert "HTTP 502" in str(e)
+    finally:
+        urllib.request.urlopen, o.time.sleep = orig_open, orig_sleep
+
+
+def test_http_json_4xx_is_not_retried():
+    import io, urllib.error, urllib.request
+    calls = {"n": 0}
+    def fake(req, timeout=0):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(req.full_url, 400, "bad", {}, io.BytesIO(b"x"))
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = fake
+    try:
+        try:
+            o.http_json("https://example.org/x")
+        except RuntimeError:
+            pass
+        assert calls["n"] == 1
+    finally:
+        urllib.request.urlopen = orig
