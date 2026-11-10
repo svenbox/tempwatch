@@ -22,6 +22,10 @@ kontroll av element. Endast Python 3.12 och standardbiblioteket.
 - **Elkostnad** = energi × (medelspotpris i elområdet + påslag) × (1 + moms).
 - **Elementkontroll** jämför varje element med sitt eget normalläge (kräver 3 dygn data).
 
+## Mer dokumentation
+- [Drift och felsökning](docs/drift.md): vad som händer, larm, filer, kommandon, felsökning, underhåll.
+- [API-anteckningar](docs/api-anteckningar.md): vad vi vet om Ecowitt, Adax, spotpriser och Telegram, och hur säkert.
+
 ## Installation på servern
 ```bash
 cd /home/svante/docker && git clone https://github.com/svenbox/tempwatch
