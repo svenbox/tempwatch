@@ -450,3 +450,26 @@ def test_run_once_energy_survives_adax_outage():
 def test_run_once_sends_when_everything_is_down():
     msg, _ = _run({}, [], adax_down=True, eco_down=True)
     assert msg.startswith("Offerberg temp") and "Ecowitt otillgänglig" in msg
+
+
+def test_adax_energy_tolerates_one_failing_room():
+    orig = o.adax_points
+    def fake(token, rid):
+        if rid == 2:
+            raise RuntimeError("HTTP 502")
+        return [{"fromTime": TODAY, "toTime": TODAY + D, "energyWh": 700}]
+    o.adax_points = fake
+    try:
+        wh, est, new = o.adax_energy({}, "T", [1, 2], START, NOW, {})
+    finally:
+        o.adax_points = orig
+    assert wh == 700 and est is True and set(new) == {"1", "2"}
+
+
+def test_minute_bins_shows_sawtooth():
+    # Sågtand: energin sedan hel timme växer med minut i timmen.
+    hour = 1793674800000  # hel timme
+    rows = [{"t": hour + m * 60000, "id": 1, "wh": float(m)} for m in (1, 16, 31, 46)]
+    b = o.minute_bins(rows)
+    assert [round(v[1]) for v in b.values()] == [1, 16, 31, 46]
+    assert list(b) == ["00-14", "15-29", "30-44", "45-59"]

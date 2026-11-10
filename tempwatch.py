@@ -7,7 +7,7 @@ Körning:
   python tempwatch.py --once      # skicka direkt en gång
   python tempwatch.py --dry-run   # skriv ut meddelandet, skicka inte
   python tempwatch.py             # loop: skickar kl 07:30 och loggar element var 15:e minut
-Felsökning: --debug-price, --debug-devices, --debug-energy
+Felsökning: --debug-price, --debug-devices, --debug-energy, --debug-semantics
 """
 import argparse
 import datetime as dt
@@ -162,7 +162,13 @@ def adax_energy(env, token, room_ids, start_ms, now_ms, state):
     for rid in room_ids:
         key = str(rid)
         snaps = [x for x in state.get(key, []) if x["at"] > cutoff]
-        pts = adax_points(token, rid)
+        try:
+            pts = adax_points(token, rid)
+        except RuntimeError as e:
+            print(f"energy_log för rum {rid} misslyckades: {e}", file=sys.stderr)
+            est = True  # rummet saknas i summan
+            new[key] = snaps
+            continue
         wh, e, cur = energy_since(pts, start_ms, now_ms, snaps)
         total += wh
         est = est or e
@@ -567,7 +573,11 @@ def debug_energy(env):
     state = load_state(env)
     rows = load_samples(env, now_ms)
     for r in adax_content(token).get("rooms", []):
-        pts = adax_points(token, r["id"])
+        try:
+            pts = adax_points(token, r["id"])
+        except RuntimeError as e:
+            print(f"{r['name']} (id {r['id']}): FEL {e}")
+            continue
         res = energy_since(pts, start, now_ms, state.get(str(r["id"]), []))
         print(f"{r['name']} (id {r['id']}): punkter={len(pts)} "
               f"sedan_start_Wh={res[0]:.0f} uppskattat={res[1]} nu={res[2]}")
@@ -582,6 +592,39 @@ def debug_energy(env):
                   f"egna prover={'saknas' if own is None else f'{own:.0f} Wh'}")
     print(f"egen energi sedan start (alla rum): {own_energy(rows, start, now_ms)}")
     print(f"start_ms={start} nu_ms={int(now_ms)} tillstånd={state_path(env)}")
+
+
+def minute_bins(rows):
+    """{binnamn: (antal, medel-wh, andel>0)} efter minut i timmen (4 x 15 min)."""
+    bins = {}
+    for r in rows:
+        m = int(r["t"] // 60000) % 60
+        b = f"{m // 15 * 15:02d}-{m // 15 * 15 + 14:02d}"
+        bins.setdefault(b, []).append(r["wh"])
+    return {b: (len(v), sum(v) / len(v), sum(1 for x in v if x > 0) / len(v))
+            for b, v in sorted(bins.items())}
+
+
+def debug_semantics(env):
+    """Avgör om energyWh är 'senaste 60 min' (jämn) eller 'sedan hel timme' (sågtand)."""
+    now_ms = time.time() * 1000
+    rows = load_samples(env, now_ms)
+    print(f"antal prov: {len(rows)}")
+    print("minut i timmen -> antal, medel-Wh, andel > 0")
+    for b, (n, mean, share) in minute_bins(rows).items():
+        print(f"  {b}: {n:5d}  {mean:7.1f}  {share:5.2f}")
+    tot = {}
+    for r in rows:
+        if r["t"] > now_ms - DAY_MS:
+            tot[r["id"]] = tot.get(r["id"], 0.0) + r["wh"]
+    if not tot:
+        return
+    top = max(tot, key=tot.get)
+    print(f"mest aktiva elementet senaste dygnet: id {top}; senaste proven:")
+    last = [r for r in rows if r["id"] == top][-16:]
+    for r in last:
+        t = dt.datetime.fromtimestamp(r["t"] / 1000, TZ)
+        print(f"  {t:%d %H:%M}  {r['wh']:.0f} Wh")
 
 
 def debug_devices(env):
@@ -627,11 +670,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--debug-price", action="store_true")
     ap.add_argument("--debug-devices", action="store_true")
+    ap.add_argument("--debug-semantics", action="store_true")
     ap.add_argument("--debug-energy", action="store_true")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     env = os.environ
+    if a.debug_semantics:
+        debug_semantics(env)
+        return
     if a.debug_devices:
         debug_devices(env)
         return
