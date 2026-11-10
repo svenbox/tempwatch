@@ -536,18 +536,18 @@ def _frost_env():
 
 def test_check_frost_sends_once_then_clears():
     env = _frost_env()
-    sent, temps = [], [(-6.0, 7.5)]
-    orig_e, orig_t = o.ecowitt_temps, o.telegram_send
-    o.ecowitt_temps = lambda e: temps[0]
+    sent, temps = [], [(-6.0, 7.5, None)]
+    orig_e, orig_t = o.ecowitt_reading, o.telegram_send
+    o.ecowitt_reading = lambda e: temps[0]
     o.telegram_send = lambda e, text: sent.append(text)
     try:
         n = 1_000_000_000_000
         assert o.check_frost(env, now_ms=n) == "alarm"
         assert o.check_frost(env, now_ms=n + 15 * 60000) is None      # ingen spam
-        temps[0] = (-4.0, 9.2)
+        temps[0] = (-4.0, 9.2, None)
         assert o.check_frost(env, now_ms=n + 3_600_000) == "clear"
     finally:
-        o.ecowitt_temps, o.telegram_send = orig_e, orig_t
+        o.ecowitt_reading, o.telegram_send = orig_e, orig_t
     assert len(sent) == 2
     assert sent[0].startswith("⚠ Frostlarm") and "7,5 °C" in sent[0] and "Utomhus: -6,0 °C" in sent[0]
     assert sent[1].startswith("✅") and "7,5 °C" in sent[1]
@@ -560,8 +560,8 @@ def test_check_frost_retries_after_failed_send():
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("Telegram nere")
-    orig_e, orig_t = o.ecowitt_temps, o.telegram_send
-    o.ecowitt_temps = lambda e: (-6.0, 5.0)
+    orig_e, orig_t = o.ecowitt_reading, o.telegram_send
+    o.ecowitt_reading = lambda e: (-6.0, 5.0, None)
     o.telegram_send = flaky
     try:
         n = 1_000_000_000_000
@@ -572,19 +572,126 @@ def test_check_frost_retries_after_failed_send():
             pass
         assert o.check_frost(env, now_ms=n + 900_000) == "alarm"   # nytt försök, inte tyst
     finally:
-        o.ecowitt_temps, o.telegram_send = orig_e, orig_t
+        o.ecowitt_reading, o.telegram_send = orig_e, orig_t
 
 
 def test_check_frost_threshold_from_env_and_dry_run_does_not_send():
     env = {**_frost_env(), "ALERT_INDOOR_BELOW_C": "5,5"}
     sent = []
-    orig_e, orig_t = o.ecowitt_temps, o.telegram_send
-    o.ecowitt_temps = lambda e: (-6.0, 7.0)
+    orig_e, orig_t = o.ecowitt_reading, o.telegram_send
+    o.ecowitt_reading = lambda e: (-6.0, 7.0, None)
     o.telegram_send = lambda e, text: sent.append(text)
     try:
         assert o.check_frost(env, now_ms=1) is None          # 7 > 5,5
         env["ALERT_INDOOR_BELOW_C"] = "8"
         assert o.check_frost(env, dry=True, now_ms=1) == "alarm"
     finally:
-        o.ecowitt_temps, o.telegram_send = orig_e, orig_t
+        o.ecowitt_reading, o.telegram_send = orig_e, orig_t
     assert sent == []
+
+
+# ---------- vakthund ----------
+
+def test_decide_watch_needs_consecutive_failures_and_clears():
+    n, h = 1_000_000_000_000, 3_600_000
+    st = {}
+    act, st = o.decide_watch("fail", st, n, limit=3)
+    assert act is None and st["fails"] == 1
+    act, st = o.decide_watch("ok", st, n + 900_000, limit=3)        # blipp: nollställs
+    assert act is None and st == {"fails": 0, "active": False}
+    for k in range(2):
+        act, st = o.decide_watch("stale", st, n + k * 900_000, limit=3)
+        assert act is None
+    act, st = o.decide_watch("stale", st, n + 2 * 900_000, limit=3)
+    assert act == "alarm" and st["active"]
+    act, st = o.decide_watch("stale", st, n + 3 * 900_000, limit=3)  # ingen spam
+    assert act is None
+    act, st = o.decide_watch("fail", st, n + 13 * h, limit=3, repeat_h=12)
+    assert act == "remind"
+    act, st = o.decide_watch("ok", st, n + 14 * h, limit=3)
+    assert act == "clear" and st == {"fails": 0, "active": False}
+
+
+def test_epoch_ms_handles_seconds_ms_strings_and_junk():
+    assert o.epoch_ms("1793717721") == 1793717721000
+    assert o.epoch_ms(1793717721410) == 1793717721410
+    assert o.epoch_ms(None) is None and o.epoch_ms("x") is None and o.epoch_ms(0) is None
+
+
+def _watch_run(readings, now_ms, env=None, sent=None):
+    env = env or _frost_env()
+    sent = [] if sent is None else sent
+    orig_e, orig_t = o.ecowitt_reading, o.telegram_send
+    it = iter(readings)
+    def fake(e):
+        v = next(it)
+        if isinstance(v, Exception):
+            raise v
+        return v
+    o.ecowitt_reading, o.telegram_send = fake, lambda e, text: sent.append(text)
+    return env, sent, orig_e, orig_t
+
+
+def test_watchdog_alarms_after_three_failures_and_recovers():
+    n = 1_700_000_000_000
+    env, sent, oe, ot = _watch_run([RuntimeError("HTTP 502")] * 3 + [(-5.0, 12.0, n + 4 * 900_000)], n)
+    try:
+        for k in range(3):
+            o.check_frost(env, now_ms=n + k * 900_000)
+        assert len(sent) == 1 and sent[0].startswith("⚠ Frostlarmet är blint")
+        assert "HTTP 502" in sent[0] and "3 gånger" in sent[0]
+        o.check_frost(env, now_ms=n + 4 * 900_000)
+        assert len(sent) == 2 and sent[1].startswith("✅")
+    finally:
+        o.ecowitt_reading, o.telegram_send = oe, ot
+
+
+def test_watchdog_detects_stale_sensor_and_skips_frost_logic():
+    n = 1_700_000_000_000
+    old = n - 3 * 3_600_000                  # senaste mätning för 3 h sedan, kallt värde
+    env, sent, oe, ot = _watch_run([(-5.0, 4.0, old)] * 3, n)
+    try:
+        for k in range(3):
+            assert o.check_frost(env, now_ms=n + k * 900_000) is None   # inget frostlarm på gammal data
+        assert len(sent) == 1 and "inte rapporterat" in sent[0]
+    finally:
+        o.ecowitt_reading, o.telegram_send = oe, ot
+
+
+def test_watchdog_alarm_retried_if_telegram_fails():
+    n = 1_700_000_000_000
+    env = _frost_env()
+    state = {"n": 0}
+    oe, ot = o.ecowitt_reading, o.telegram_send
+    def boom(e):
+        raise RuntimeError("nere")
+    def flaky(e, text):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise RuntimeError("Telegram nere")
+    o.ecowitt_reading, o.telegram_send = boom, flaky
+    try:
+        o.check_frost(env, now_ms=n)
+        o.check_frost(env, now_ms=n + 900_000)
+        try:
+            o.check_frost(env, now_ms=n + 2 * 900_000)      # larm, men Telegram faller
+            assert False
+        except RuntimeError:
+            pass
+        o.check_frost(env, now_ms=n + 3 * 900_000)           # försöks igen
+        assert state["n"] == 2
+    finally:
+        o.ecowitt_reading, o.telegram_send = oe, ot
+
+
+def test_ping_ignores_failures_and_empty_url():
+    import urllib.request
+    o.ping("")                                               # ingen krasch, inget anrop
+    orig = urllib.request.urlopen
+    def boom(req, timeout=0):
+        raise OSError("nere")
+    urllib.request.urlopen = boom
+    try:
+        o.ping("https://hc-ping.example/abc")
+    finally:
+        urllib.request.urlopen = orig

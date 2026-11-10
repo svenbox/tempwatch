@@ -8,7 +8,7 @@ Körning:
   python tempwatch.py --dry-run   # skriv ut meddelandet, skicka inte
   python tempwatch.py             # loop: skickar kl 07:30 och loggar element var 15:e minut
 Frostlarm: --check-frost [--dry-run]
-Felsökning: --debug-price, --debug-devices, --debug-energy, --debug-semantics
+Felsökning: --debug-ecowitt, --debug-price, --debug-devices, --debug-energy, --debug-semantics
 """
 import argparse
 import datetime as dt
@@ -55,8 +55,7 @@ def clean(v):
     return v.strip().strip("\"'")
 
 
-def ecowitt_temps(env):
-    """Returnerar (utomhus, inomhus) i °C. Ecowitt API v3 real_time."""
+def ecowitt_raw(env):
     qs = urllib.parse.urlencode({
         "application_key": env["ECOWITT_APPLICATION_KEY"],
         "api_key": env["ECOWITT_API_KEY"],
@@ -67,9 +66,30 @@ def ecowitt_temps(env):
     j = http_json(f"https://api.ecowitt.net/api/v3/device/real_time?{qs}")
     if j.get("code") != 0:
         raise RuntimeError(f"Ecowitt: {j.get('msg')}")
-    d = j["data"]
+    return j["data"]
+
+
+def epoch_ms(v):
+    """Tidsstämpel (sekunder eller millisekunder, text eller tal) -> ms, annars None."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return int(x if x > 1e12 else x * 1000) if x > 0 else None
+
+
+def ecowitt_reading(env):
+    """(utomhus °C, inomhus °C, inomhusmätningens tid i ms | None)."""
+    d = ecowitt_raw(env)
+    ind = d["indoor"]["temperature"]
     return (float(d["outdoor"]["temperature"]["value"]),
-            float(d["indoor"]["temperature"]["value"]))
+            float(ind["value"]), epoch_ms(ind.get("time")))
+
+
+def ecowitt_temps(env):
+    """Returnerar (utomhus, inomhus) i °C. Ecowitt API v3 real_time."""
+    out, ind, _ = ecowitt_reading(env)
+    return out, ind
 
 
 ADAX = "https://api-1.adax.no/client-api"
@@ -647,24 +667,95 @@ def alert_text(action, temp, outdoor, below, state, now=None):
             f"Utomhus: {fmt(outdoor)}")
 
 
-def check_frost(env, dry=False, now_ms=None):
-    """Kontrollerar Ecowitts inomhussensor; larmar via Telegram vid för låg temperatur.
+def watch_path(env):
+    return os.path.join(os.path.dirname(state_path(env)), "watch.json")
 
-    Skickar först och sparar tillståndet efter, så ett misslyckat utskick
-    försöks igen nästa provtagning."""
-    now_ms = now_ms if now_ms is not None else time.time() * 1000
-    below = parse_price(env.get("ALERT_INDOOR_BELOW_C"))
-    below = 8.0 if below is None else below
-    hyst = parse_price(env.get("ALERT_HYSTERESIS_C"))
-    hyst = 1.0 if hyst is None else hyst
-    repeat = parse_price(env.get("ALERT_REPEAT_HOURS"))
-    repeat = 6.0 if repeat is None else repeat
-    outdoor, indoor = ecowitt_temps(env)
+
+def decide_watch(kind, state, now_ms, limit=3, repeat_h=12.0):
+    """Vakthundens tillstånd. kind: 'ok', 'fail' (kan inte läsa) eller 'stale'
+    (sensorn har slutat rapportera). Larmar först efter `limit` dåliga kontroller
+    i rad, så en enstaka blipp inte ger larm."""
+    active = state.get("active", False)
+    if kind == "ok":
+        return ("clear" if active else None), {"fails": 0, "active": False}
+    fails = state.get("fails", 0) + 1
+    new = {**state, "fails": fails, "kind": kind}
+    if fails >= limit and not active:
+        return "alarm", {**new, "active": True, "since": now_ms, "last_sent": now_ms}
+    if active and now_ms - state.get("last_sent", 0) >= repeat_h * 3_600_000:
+        return "remind", {**new, "last_sent": now_ms}
+    return None, new
+
+
+def watch_text(action, kind, detail, state, now=None):
+    now = now or dt.datetime.now(TZ)
+    if action == "clear":
+        return "✅ Offerberg: Ecowitt-kontrollen fungerar igen\nFrostlarmet är åter i drift."
+    head = ("⚠ Frostlarmet är blint" if action == "alarm"
+            else "⚠ Frostlarmet är fortfarande blint")
+    why = (f"Inomhussensorn har inte rapporterat sedan {detail}."
+           if kind == "stale" else f"Ecowitt kan inte läsas ({detail}).")
+    n = state.get("fails", 0)
+    return f"{head}\n{why}\nKontrollerna har misslyckats {n} gånger i rad."
+
+
+def load_json(path):
     try:
-        with open(alert_path(env)) as f:
-            state = json.load(f)
+        with open(path) as f:
+            return json.load(f)
     except (OSError, ValueError):
-        state = {}
+        return {}
+
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def check_frost(env, dry=False, now_ms=None):
+    """Kontrollerar Ecowitts inomhussensor; larmar via Telegram vid för låg temperatur,
+    och larmar separat (vakthund) om sensorn inte går att läsa eller har slutat
+    rapportera. Skickar först och sparar tillståndet efter, så ett misslyckat
+    utskick försöks igen nästa provtagning. Returnerar frostlarmets åtgärd."""
+    now_ms = now_ms if now_ms is not None else time.time() * 1000
+    num = lambda k, d: d if parse_price(env.get(k)) is None else parse_price(env.get(k))
+    below, hyst, repeat = (num("ALERT_INDOOR_BELOW_C", 8.0),
+                           num("ALERT_HYSTERESIS_C", 1.0), num("ALERT_REPEAT_HOURS", 6.0))
+    stale_min, fail_limit = num("ALERT_STALE_MINUTES", 90.0), int(num("ALERT_FAIL_CHECKS", 3))
+    # 1. Läs sensorn
+    kind, detail, reading = "ok", "", None
+    try:
+        reading = ecowitt_reading(env)
+        ts = reading[2]
+        if ts is not None and now_ms - ts > stale_min * 60000:
+            s0 = dt.datetime.fromtimestamp(ts / 1000, TZ)
+            kind, detail = "stale", f"{s0:%d/%m %H:%M}"
+    except Exception as e:
+        kind, detail = "fail", str(e)[:150]
+    # 2. Vakthund
+    wstate = load_json(watch_path(env))
+    w_action, w_new = decide_watch(kind, wstate, now_ms, fail_limit,
+                                   num("ALERT_WATCH_REPEAT_HOURS", 12.0))
+    if dry:
+        print(f"sensor: {kind} {detail}; vakthund: {w_action}")
+    elif w_action:
+        try:
+            telegram_send(env, watch_text(w_action, kind, detail, w_new))
+        except Exception:
+            # Behåll räknaren men inte "larmat", så larmet försöks igen.
+            save_json(watch_path(env), {**w_new, "active": wstate.get("active", False),
+                                        "last_sent": wstate.get("last_sent", 0),
+                                        "since": wstate.get("since")})
+            raise
+    if not dry and w_new != wstate:
+        save_json(watch_path(env), w_new)
+    if kind != "ok":
+        return None                      # föråldrad eller saknad data används inte
+    # 3. Frostlarm
+    outdoor, indoor = reading[0], reading[1]
+    state = load_json(alert_path(env))
     action, new = decide_alert(indoor, state, now_ms, below, hyst, repeat)
     if dry:
         print(f"inomhus {fmt(indoor)}, gräns {fmt_target(below)}, åtgärd: {action}")
@@ -672,11 +763,32 @@ def check_frost(env, dry=False, now_ms=None):
     if action:
         telegram_send(env, alert_text(action, indoor, outdoor, below, new))
     if new != state:
-        tmp = alert_path(env) + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(new, f)
-        os.replace(tmp, alert_path(env))
+        save_json(alert_path(env), new)
     return action
+
+
+def ping(url):
+    """Hjärtslag till en extern övervakning (t.ex. healthchecks.io). Fel ignoreras."""
+    url = clean(url or "")
+    if not url:
+        return
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        urllib.request.urlopen(req, timeout=10).close()
+    except Exception as e:
+        print(f"Hjärtslag misslyckades: {e}", file=sys.stderr)
+
+
+def debug_ecowitt(env):
+    """Visar vad Ecowitt returnerar för temperaturerna (inga nycklar skrivs ut)."""
+    d = ecowitt_raw(env)
+    for k in ("outdoor", "indoor"):
+        print(k, json.dumps(d.get(k, {}).get("temperature")))
+    ts = epoch_ms(d["indoor"]["temperature"].get("time"))
+    if ts:
+        print(f"inomhus mättes för {(time.time() * 1000 - ts) / 60000:.1f} min sedan")
+    else:
+        print("ingen tidsstämpel hittades; föråldrad data kan inte upptäckas")
 
 
 def seconds_until_next(now=None):
@@ -798,11 +910,15 @@ def main():
     ap.add_argument("--debug-devices", action="store_true")
     ap.add_argument("--debug-semantics", action="store_true")
     ap.add_argument("--check-frost", action="store_true")
+    ap.add_argument("--debug-ecowitt", action="store_true")
     ap.add_argument("--debug-energy", action="store_true")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     env = os.environ
+    if a.debug_ecowitt:
+        debug_ecowitt(env)
+        return
     if a.check_frost:
         check_frost(env, dry=a.dry_run)
         return
@@ -835,6 +951,7 @@ def main():
                 check_frost(env)
             except Exception as e:
                 print(f"Frostkontroll misslyckades: {e}", file=sys.stderr)
+            ping(env.get("HEARTBEAT_URL"))
             next_sample = next_sample_time(time.time())
         if now >= next_send:
             try:
