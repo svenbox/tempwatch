@@ -302,37 +302,68 @@ def test_next_send_correct_across_dst_changes():
 
 # ---------- egen energi från prover ----------
 
-SAMPLE = o.SAMPLE_EVERY * 1000
+HOUR = 3_600_000
 
 
-def _samples(n_hours, per_element, end=NOW, room=None):
-    """Prov var 15:e minut bakåt i n_hours; per_element = {id: wh}."""
-    rows, t = [], end - 1000
-    while t > end - n_hours * H:
-        for i, wh in per_element.items():
-            rows.append({"t": t, "id": i, "et": t, "wh": float(wh),
-                         "room": room if room is not None else i // 10})
-        t -= SAMPLE
+def _saw(n_hours, watts, end=NOW, room_of=lambda i: i // 10):
+    """Prov som Adax ger dem: energin sedan hel timme (sågtand), vid minut
+    13, 28, 43, 58. watts = {element: Wh per timme vid konstant effekt}."""
+    rows = []
+    for h in range(int(end // HOUR) - n_hours - 1, int(end // HOUR) + 1):
+        for minute in (13, 28, 43, 58):
+            t = h * HOUR + minute * 60000
+            if end - n_hours * HOUR <= t < end:
+                for i, p in watts.items():
+                    rows.append({"t": t, "id": i, "et": t, "room": room_of(i),
+                                 "wh": p * minute / 60})
     return rows
 
 
-def test_own_energy_is_mean_times_hours():
-    rows = _samples(26, {11: 100, 12: 50})
-    # 24 h, två element: (100 + 50) Wh/h * 24 h = 3600 Wh
-    assert abs(o.own_energy(rows, NOW - 24 * H, NOW) - 3600) < 1e-6
+def test_own_energy_sums_hourly_maxima_not_mean_of_sawtooth():
+    rows = _saw(26, {11: 100, 12: 50})
+    wh, est = o.own_energy(rows, NOW - 24 * HOUR, NOW)
+    true = 150 * 24                       # 3600 Wh
+    assert 0.94 * true < wh < true        # :58-provet ligger ett par minuter under full timme
+    assert est is False
+    # Det gamla sättet (medelvärde x 24) hade gett ungefär hälften:
+    mean = sum(r["wh"] for r in rows) / len(rows)
+    assert mean * 24 * 2 < 0.6 * true
 
 
 def test_own_energy_filters_room():
-    rows = _samples(26, {11: 100, 21: 50})
-    assert abs(o.own_energy(rows, NOW - 24 * H, NOW, room=1) - 2400) < 1e-6
+    rows = _saw(26, {11: 100, 21: 50})
+    wh, _ = o.own_energy(rows, NOW - 24 * HOUR, NOW, room=1)
+    assert 0.94 * 2400 < wh < 2400
 
 
-def test_own_energy_none_when_coverage_thin():
-    short = _samples(5, {11: 100})                  # bara 5 h data
-    assert o.own_energy(short, NOW - 24 * H, NOW) is None
-    assert o.own_energy([], NOW - 24 * H, NOW) is None
-    sparse = [r for k, r in enumerate(_samples(26, {11: 100})) if k % 8 == 0]
-    assert o.own_energy(sparse, NOW - 24 * H, NOW) is None   # < 50 % av proven
+def test_own_energy_none_when_data_thin():
+    assert o.own_energy(_saw(5, {11: 100}), NOW - 24 * HOUR, NOW) is None
+    assert o.own_energy([], NOW - 24 * HOUR, NOW) is None
+
+
+def test_own_energy_fills_few_missing_hours_and_flags_estimate():
+    rows = [r for r in _saw(26, {11: 100})
+            if not (NOW - 12 * HOUR <= r["t"] < NOW - 10 * HOUR)]  # två timmar saknas
+    wh, est = o.own_energy(rows, NOW - 24 * HOUR, NOW)
+    assert est is True and 0.94 * 2400 < wh < 2400
+
+
+def test_hourly_totals_takes_max_in_hour():
+    rows = [{"t": TODAY + 3 * 60000, "id": 1, "wh": 0.0},
+            {"t": TODAY + 28 * 60000, "id": 1, "wh": 250.0},
+            {"t": TODAY + 58 * 60000, "id": 1, "wh": 495.0}]
+    assert o.hourly_totals(rows) == {1: {TODAY // HOUR: (495.0, 58.0)}}
+
+
+def test_next_sample_time_is_aligned_to_13_28_43_58():
+    import datetime as dt
+    base = dt.datetime(2026, 11, 10, 7, 0, 5, tzinfo=dt.timezone.utc).timestamp()
+    got = [o.next_sample_time(base)]
+    for _ in range(4):
+        got.append(o.next_sample_time(got[-1]))
+    minutes = [int(g // 60) % 60 for g in got]
+    assert minutes == [13, 28, 43, 58, 13]
+    assert all(g % 60 == 0 for g in got)
 
 
 def test_prune_samples_keeps_recent_only():
@@ -422,14 +453,16 @@ PRICE_ENV = {"ELECTRICITY_AREA": "SE2", "ELECTRICITY_ADDON_SEK_PER_KWH": "0,6789
 
 
 def test_run_once_uses_own_samples_and_skips_adax_energy_log():
-    rows = _samples(26, {11: 100, 12: 50}, end=int(NOW_REAL), room=1)
+    rows = _saw(26, {11: 100, 12: 50}, end=int(NOW_REAL), room_of=lambda i: 1)
     msg, calls = _run(PRICE_ENV, rows)
     lines = msg.splitlines()
     assert lines[:3] == ["Offerberg temp", "Utomhus: -6,0 °C", "Inomhus (köket): 16,6 °C"]
     assert "  Kök: 16,8 °C (mål 18 °C)" in lines
-    # 150 Wh/h * 24 h = 3,6 kWh * (0,10 + 0,6789) * 1,25 = 3,505 kr -> 3,51
-    assert any(l.startswith("Energiförbrukning sedan igår") and "3,6 kWh (≈ 3,51 kr)" in l
-               and "uppskattat" not in l for l in lines)
+    # ca 150 Wh/h * 24 h = 3,6 kWh (några % lägre av provens läge i timmen)
+    import re
+    e = [l for l in lines if l.startswith("Energiförbrukning sedan igår")][0]
+    kwh = float(re.search(r"([\d,]+) kWh", e).group(1).replace(",", "."))
+    assert 3.3 <= kwh <= 3.7 and "uppskattat" not in e and "kr)" in e
     assert "adax_points" not in calls          # inga energy_log-anrop behövs
     assert not any("⚠" in l and "otillgänglig" in l for l in lines)
 
@@ -441,7 +474,7 @@ def test_run_once_falls_back_to_adax_when_samples_missing():
 
 
 def test_run_once_energy_survives_adax_outage():
-    rows = _samples(26, {11: 100}, end=int(NOW_REAL), room=1)
+    rows = _saw(26, {11: 100}, end=int(NOW_REAL), room_of=lambda i: 1)
     msg, _ = _run(PRICE_ENV, rows, adax_down=True)
     assert "Energiförbrukning" in msg and "Adax otillgänglig" in msg
     assert "okänt" in msg                       # rummen är okända

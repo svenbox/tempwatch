@@ -337,7 +337,8 @@ def run_once(env, dry=False):
         errors.append(f"Adax otillgänglig ({e})")
     try:
         # Primärt egna prover (täcker exakt perioden); annars Adax dygnspunkter.
-        wh, est = own_energy(rows, start, now_ms), False
+        own = own_energy(rows, start, now_ms)
+        wh, est = own if own else (None, False)
         if wh is None:
             if content is None:
                 raise RuntimeError("för få egna prover och Adax otillgängligt")
@@ -379,7 +380,15 @@ def run_once(env, dry=False):
         telegram_send(env, msg)
 
 
-SAMPLE_EVERY = 15 * 60
+def next_sample_time(now_s):
+    """Nästa tidpunkt (epoch-sekunder) vid minut 13, 28, 43 eller 58.
+
+    Provet vid :58 ligger strax före hel timme och visar timmens fulla energi."""
+    t = int(now_s // 60) * 60
+    for k in range(1, 61):
+        cand = t + 60 * k
+        if (cand // 60) % 15 == 13:
+            return cand
 
 
 def samples_path(env):
@@ -412,7 +421,10 @@ def sample_devices(env):
 
 
 DAY_MS = 24 * 3600 * 1000
-MIN_SAMPLES_PER_DAY = 48  # av max 96 (var 15:e minut); färre = för tunn data
+HOUR_MS = 3_600_000
+MIN_HOURS_PER_DAY = 18    # av 24 timmar; färre med ett användbart prov = för tunn data
+MAX_MISSING_HOURS = 4     # fler saknade timmar -> egen energi används inte
+LATE_MINUTE = 40          # ett prov efter minut 40 anses visa (nästan) hela timmen
 MIN_HISTORY_DAYS = 3
 
 
@@ -437,26 +449,68 @@ def load_samples(env, now_ms, days=9):
     return rows
 
 
-def own_energy(rows, start_ms, now_ms, room=None, min_cover=0.5):
-    """Wh i [start, nu) ur egna prover, eller None om täckningen är för tunn.
+def hourly_totals(rows):
+    """{element: {timme: (Wh, minut)}}.
 
-    Varje prov är elementets energi senaste timmen, så medelvärdet av proven
-    gånger antalet timmar ger energin över perioden. Kräver prover nära både
-    start och slut och minst hälften av de förväntade provtagningarna."""
-    by = {}
+    Adax energyWh är energin *sedan hel timme* (nollställs :00 och växer), så
+    timmens energi är det största värdet i timmen. Minuten anger när det sågs."""
+    out = {}
     for r in rows:
-        if start_ms <= r["t"] < now_ms and (room is None or r.get("room") == room):
-            by.setdefault(r["id"], []).append((r["t"], r["wh"]))
-    hours = (now_ms - start_ms) / 3_600_000
-    if not by or hours <= 0:
-        return None
-    ts = [t for v in by.values() for t, _ in v]
-    if min(ts) - start_ms > 2 * 3_600_000 or now_ms - max(ts) > 2 * 3_600_000:
-        return None
-    expected = (now_ms - start_ms) / 1000 / SAMPLE_EVERY
-    if max(len(v) for v in by.values()) < min_cover * expected:
-        return None
-    return sum(sum(w for _, w in v) / len(v) for v in by.values()) * hours
+        h, m = int(r["t"] // HOUR_MS), (r["t"] % HOUR_MS) / 60000
+        d = out.setdefault(r["id"], {})
+        if h not in d or (r["wh"], m) > d[h]:
+            d[h] = (r["wh"], m)
+    return out
+
+
+def window_energy(hours, start_ms, now_ms, ongoing=True):
+    """Energi för ett element i [start, nu) ur timvärden.
+
+    Hela timmar summeras, första (delvis) timmen räknas proportionellt, och den
+    pågående timmen (om ongoing) räknas med det hittills uppmätta värdet.
+    Timmar utan prov nära slutet av timmen fylls med elementets medel."""
+    first_h, last_h = int(start_ms // HOUR_MS), int((now_ms - 1) // HOUR_MS)
+    total = missing_frac = 0.0
+    observed, missing = [], 0
+    for hh in range(first_h, last_h + 1):
+        lo, hi = max(start_ms, hh * HOUR_MS), min(now_ms, (hh + 1) * HOUR_MS)
+        frac = (hi - lo) / HOUR_MS
+        if frac <= 0:
+            continue
+        v = hours.get(hh)
+        if ongoing and hh == last_h and hi < (hh + 1) * HOUR_MS:
+            total += v[0] if v else 0.0          # pågående timme: hittills
+            continue
+        if v is None or v[1] < LATE_MINUTE:
+            missing += 1
+            missing_frac += frac
+            continue
+        total += v[0] * frac
+        observed.append(v[0])
+    if missing_frac and observed:
+        total += missing_frac * sum(observed) / len(observed)
+    return {"wh": total, "est": missing > 0, "observed": len(observed),
+            "missing": missing,
+            "active": (sum(1 for x in observed if x > 0) / len(observed)
+                       if observed else 0.0)}
+
+
+def own_energy(rows, start_ms, now_ms, room=None, ongoing=True):
+    """(Wh, uppskattat) ur egna prover i [start, nu), eller None om underlaget
+    är för tunt (fler än MAX_MISSING_HOURS timmar saknar prov nära slutet)."""
+    sel = [r for r in rows if room is None or r.get("room") == room]
+    first_h, last_h = int(start_ms // HOUR_MS), int((now_ms - 1) // HOUR_MS)
+    total, est, seen = 0.0, False, False
+    for hours in hourly_totals(sel).values():
+        if not any(first_h <= h <= last_h for h in hours):
+            continue                              # elementet saknar prov i perioden
+        seen = True
+        r = window_energy(hours, start_ms, now_ms, ongoing)
+        if r["missing"] > MAX_MISSING_HOURS or r["observed"] == 0:
+            return None
+        total += r["wh"]
+        est = est or r["est"]
+    return (total, est) if seen else None
 
 
 def prune_samples(env, now_ms, keep_days=14):
@@ -477,15 +531,15 @@ def prune_samples(env, now_ms, keep_days=14):
     os.replace(tmp, path)
 
 
-def window_stats(rows, lo, hi):
-    """{id: {n, wh_day, active}}. wh_day = medel Wh/timme * 24 (Wh per dygn)."""
-    by = {}
-    for r in rows:
-        if lo <= r["t"] < hi:
-            by.setdefault(r["id"], []).append(r["wh"])
-    return {i: {"n": len(v), "wh_day": sum(v) / len(v) * 24,
-                "active": sum(1 for x in v if x > 0) / len(v)}
-            for i, v in by.items()}
+def window_stats(hours, lo, hi, ongoing=False):
+    """{id: {n, wh_day, active}} för [lo, hi). n = timmar med användbart prov."""
+    out = {}
+    for i, h in hours.items():
+        if not any(int(lo // HOUR_MS) <= x <= int((hi - 1) // HOUR_MS) for x in h):
+            continue
+        r = window_energy(h, lo, hi, ongoing)
+        out[i] = {"n": r["observed"], "wh_day": r["wh"], "active": r["active"]}
+    return out
 
 
 def find_anomalies(rows, now_ms, factor=1.5, min_extra_wh=1000.0,
@@ -495,9 +549,10 @@ def find_anomalies(rows, now_ms, factor=1.5, min_extra_wh=1000.0,
     Jämför senaste dygnet med elementets egen median de föregående dygnen,
     och med övriga elements förändring (kalla dagar höjer alla)."""
     import statistics as st
-    wins = [window_stats(rows, now_ms - (k + 1) * DAY_MS, now_ms - k * DAY_MS)
-            for k in range(8)]
-    ok = lambda w, i: i in w and w[i]["n"] >= MIN_SAMPLES_PER_DAY
+    hours = hourly_totals(rows)
+    wins = [window_stats(hours, now_ms - (k + 1) * DAY_MS, now_ms - k * DAY_MS,
+                         ongoing=(k == 0)) for k in range(8)]
+    ok = lambda w, i: i in w and w[i]["n"] >= MIN_HOURS_PER_DAY
     history = sum(1 for w in wins[1:] if any(ok(w, i) for i in w))
     today = {i: v for i, v in wins[0].items() if ok(wins[0], i)}
     if history < MIN_HISTORY_DAYS or not today:
@@ -587,9 +642,9 @@ def debug_energy(env):
         if done:
             last = max(done, key=lambda p: int(p["toTime"]))
             own = own_energy(rows, int(last["fromTime"]), int(last["toTime"]),
-                             room=r["id"])
+                             room=r["id"], ongoing=False)
             print(f"    senaste avslutade dygn: Adax={last['energyWh']} Wh, "
-                  f"egna prover={'saknas' if own is None else f'{own:.0f} Wh'}")
+                  f"egna prover={'saknas' if own is None else f'{own[0]:.0f} Wh'}")
     print(f"egen energi sedan start (alla rum): {own_energy(rows, start, now_ms)}")
     print(f"start_ms={start} nu_ms={int(now_ms)} tillstånd={state_path(env)}")
 
@@ -701,7 +756,7 @@ def main():
                 sample_devices(env)
             except Exception as e:  # provtagning får aldrig stoppa notisen
                 print(f"Provtagning misslyckades: {e}", file=sys.stderr)
-            next_sample = time.time() + SAMPLE_EVERY
+            next_sample = next_sample_time(time.time())
         if now >= next_send:
             try:
                 run_once(env)

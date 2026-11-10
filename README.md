@@ -6,10 +6,12 @@ kontroll av element. Endast Python 3.12 och standardbiblioteket.
 
 ## Så fungerar det
 - **Notisen** skickas kl 07:30 svensk tid (sommartid hanteras).
-- **Provtagning** var 15:e minut: varje elements timenergi från Adax sparas i
-  `/state/devices.jsonl` (rensas efter 14 dygn).
-- **Energin** "sedan igår 07:30" räknas ur de egna proverna (medelvärde × timmar).
-  Saknas prover används Adax dygnspunkter (markeras `– uppskattat`).
+- **Provtagning** vid minut :13, :28, :43 och :58 varje timme: varje elements `energyWh`
+  från Adax sparas i `/state/devices.jsonl` (rensas efter 14 dygn). Adax `energyWh` är
+  energin *sedan hel timme* (nollställs :00), så provet vid :58 visar timmens fulla energi.
+- **Energin** "sedan igår 07:30" = summan av timmarnas största värde (pågående timme: hittills).
+  Några timmar utan prov fylls med medelvärde (`– uppskattat`); saknas fler används Adax
+  dygnspunkter, som ibland saknar hela dygn.
 - **Elkostnad** = energi × (medelspotpris i elområdet + påslag) × (1 + moms).
 - **Elementkontroll** jämför varje element med sitt eget normalläge (kräver 3 dygn data).
 
@@ -31,6 +33,7 @@ docker compose run --rm tempwatch python tempwatch.py --once      # skicka nu
 docker compose run --rm tempwatch python tempwatch.py --debug-price    # prisinställningar och spotpris
 docker compose run --rm tempwatch python tempwatch.py --debug-devices  # råsvar från Adax (element)
 docker compose run --rm tempwatch python tempwatch.py --debug-energy   # egna prover mot Adax dygnssumma
+docker compose run --rm tempwatch python tempwatch.py --debug-semantics # hur energyWh beter sig över timmen
 ```
 
 ## Inställningar
