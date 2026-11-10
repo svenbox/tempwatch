@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Morgonnotis (07:30) med temperaturer från Ecowitt och Adax till Telegram.
+"""Morgonnotis (07:30) med temperaturer, energi och elkostnad till Telegram.
 
+Datakällor: Ecowitt (ute/inne), Adax (rum, element) och elprisetjustnu.se.
 Endast standardbibliotek. Konfiguration via miljövariabler (se .env.example).
 Körning:
   python tempwatch.py --once      # skicka direkt en gång
   python tempwatch.py --dry-run   # skriv ut meddelandet, skicka inte
-  python tempwatch.py             # loop: skickar varje dag kl 07:30
+  python tempwatch.py             # loop: skickar kl 07:30 och loggar element var 15:e minut
+Felsökning: --debug-price, --debug-devices, --debug-energy
 """
 import argparse
 import datetime as dt
@@ -125,21 +127,6 @@ def energy_since(points, start_ms, now_ms, snaps=()):
     return total, estimated, current
 
 
-def covered_ms(points, start_ms, now_ms):
-    """Hur många ms av [start, nu] som täcks av dygnspunkter (utan dubbletter)."""
-    spans = sorted({(max(int(p["fromTime"]), start_ms), min(int(p["toTime"]), now_ms))
-                    for p in points})
-    total, end = 0, start_ms
-    for f, t in spans:
-        if t <= f:
-            continue
-        f = max(f, end)
-        if t > f:
-            total += t - f
-            end = t
-    return total
-
-
 def window_start(now=None):
     """Igår kl 07:30 lokal tid (ms)."""
     now = now or dt.datetime.now(TZ)
@@ -169,23 +156,20 @@ def save_state(env, state):
 
 
 def adax_energy(env, token, room_ids, start_ms, now_ms, state):
-    """(Wh, uppskattat, nya ögonblicksbilder {rum: [...]}, ofullständigt)."""
-    total, est, new, best = 0.0, False, {}, 0
+    """(Wh, uppskattat, nya ögonblicksbilder {rum: [...]}) ur Adax dygnspunkter."""
+    total, est, new = 0.0, False, {}
     cutoff = now_ms - 4 * 86400 * 1000
     for rid in room_ids:
         key = str(rid)
         snaps = [x for x in state.get(key, []) if x["at"] > cutoff]
         pts = adax_points(token, rid)
-        best = max(best, covered_ms(pts, start_ms, now_ms))
         wh, e, cur = energy_since(pts, start_ms, now_ms, snaps)
         total += wh
         est = est or e
         if cur:
             snaps.append({"at": int(now_ms), **cur})
         new[key] = snaps
-    # Ofullständigt om inget rum har data för hela perioden (minuttolerans).
-    incomplete = best < (now_ms - start_ms) - 60_000
-    return total, est, new, incomplete
+    return total, est, new
 
 
 def spot_average(area, start_ms, now_ms):
@@ -216,7 +200,7 @@ def spot_average(area, start_ms, now_ms):
 def price_per_kwh(env, start_ms, now_ms):
     """(pris kr/kWh inkl. moms | None, anteckning).
 
-    Med ELECTRICITY_AREA (t.ex. SE4): medelspot + ELECTRICITY_ADDON_SEK_PER_KWH
+    Med ELECTRICITY_AREA (t.ex. SE2): medelspot + ELECTRICITY_ADDON_SEK_PER_KWH
     (nät, skatt, påslag; exkl. moms) + moms (ELECTRICITY_VAT, standard 0,25).
     Annars fast ELECTRICITY_PRICE_SEK_PER_KWH."""
     area = clean(env.get("ELECTRICITY_AREA") or "").upper()
@@ -224,12 +208,11 @@ def price_per_kwh(env, start_ms, now_ms):
         avg = spot_average(area, start_ms, now_ms)
         if avg is None:
             raise RuntimeError(f"inga spotpriser hittades för {area} i perioden")
-        if avg is not None:
-            addon = parse_price(env.get("ELECTRICITY_ADDON_SEK_PER_KWH")) or 0.0
-            vat = parse_price(env.get("ELECTRICITY_VAT"))
-            vat = 0.25 if vat is None else vat
-            price = (avg + addon) * (1 + vat)
-            return price, f"{fmt_num(avg, 2)} kr/kWh spot {area}, exkl. moms"
+        addon = parse_price(env.get("ELECTRICITY_ADDON_SEK_PER_KWH")) or 0.0
+        vat = parse_price(env.get("ELECTRICITY_VAT"))
+        vat = 0.25 if vat is None else vat
+        price = (avg + addon) * (1 + vat)
+        return price, f"{fmt_num(avg, 2)} kr/kWh spot {area}, exkl. moms"
     return parse_price(env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
 
 
@@ -274,8 +257,7 @@ def since_label(start_ms, now=None):
     return f"{day} {st:%H:%M}"
 
 
-def energy_line(wh, price, start_ms=None, now=None, note=None,
-                estimated=False):
+def energy_line(wh, price, start_ms=None, now=None, estimated=False):
     kwh = wh / 1000
     since = f" sedan {since_label(start_ms, now)}" if start_ms else ""
     line = f"Energiförbrukning{since}: {fmt_num(kwh, 1)} kWh"
@@ -310,29 +292,33 @@ def telegram_html(text):
 
 
 def telegram_send(env, text):
+    """Skickar via Bot API med omförsök vid 5xx/nätverksfel.
+
+    Ett omförsök efter ett förlorat svar kan i sällsynta fall ge dubbletter;
+    det är bättre än att dagens notis uteblir."""
     token, chat = telegram_token(env), clean(env.get("TELEGRAM_CHAT_ID", ""))
     if not token or not chat:
         raise RuntimeError("Telegram: TELEGRAM_TOKEN eller TELEGRAM_CHAT_ID saknas")
-    body = json.dumps({"chat_id": chat, "text": telegram_html(text),
-                       "parse_mode": "HTML",
-                       "disable_web_page_preview": True}).encode()
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage", body,
-        {"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            resp = json.load(r)
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Telegram HTTP {e.code} "
-                           f"{e.read().decode(errors='replace')[:200]}") from None
+    resp = http_json(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data={"chat_id": chat, "text": telegram_html(text),
+              "parse_mode": "HTML", "disable_web_page_preview": "true"},
+        retries=3)
     if not resp.get("ok"):
         raise RuntimeError(f"Telegram: {resp}")
 
 
 def run_once(env, dry=False):
     # Delfel ska inte stoppa notisen: visa vad som saknas.
-    eco = rooms = energy = None
-    errors, extra = [], []
+    eco = rooms = energy = content = token = None
+    errors = []
+    now_ms = time.time() * 1000
+    start = window_start()
+    try:
+        rows = load_samples(env, now_ms)
+    except Exception as e:
+        rows = []
+        errors.append(f"Provlogg otillgänglig ({e})")
     try:
         eco = ecowitt_temps(env)
     except Exception as e:
@@ -341,29 +327,30 @@ def run_once(env, dry=False):
         token = adax_token(env)
         content = adax_content(token)
         rooms = heating_rooms(content)
-        try:
-            now_ms = time.time() * 1000
-            start = window_start()
-            state = load_state(env)
-            wh, est, new, _ = adax_energy(
+    except Exception as e:
+        errors.append(f"Adax otillgänglig ({e})")
+    try:
+        # Primärt egna prover (täcker exakt perioden); annars Adax dygnspunkter.
+        wh, est = own_energy(rows, start, now_ms), False
+        if wh is None:
+            if content is None:
+                raise RuntimeError("för få egna prover och Adax otillgängligt")
+            wh, est, new = adax_energy(
                 env, token, [r["id"] for r in content.get("rooms", [])],
-                start, now_ms, state)
-            try:
-                price, note = price_per_kwh(env, start, now_ms)
-            except Exception as e:
-                errors.append(f"Spotpris otillgängligt ({e})")
-                price, note = parse_price(
-                    env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
-            energy = energy_line(wh, price, start, note=note, estimated=est)
+                start, now_ms, load_state(env))
             if not dry:
                 try:
                     save_state(env, new)
                 except OSError as e:
                     errors.append(f"Kan inte spara tillstånd ({e})")
+        try:
+            price, _ = price_per_kwh(env, start, now_ms)
         except Exception as e:
-            errors.append(f"Energi otillgänglig ({e})")
+            errors.append(f"Spotpris otillgängligt ({e})")
+            price = parse_price(env.get("ELECTRICITY_PRICE_SEK_PER_KWH"))
+        energy = energy_line(wh, price, start, estimated=est)
     except Exception as e:
-        errors.append(f"Adax otillgänglig ({e})")
+        errors.append(f"Energi otillgänglig ({e})")
     if eco:
         msg = build_message(*eco, rooms or [], energy)
         if rooms is None:
@@ -372,17 +359,13 @@ def run_once(env, dry=False):
     else:
         msg = "\n".join([TITLE] + ([energy] if energy else []))
     try:
-        now_ms = time.time() * 1000
-        rows = load_samples(env, now_ms)
         f = parse_price(env.get("ANOMALY_FACTOR")) or 1.5
         m = parse_price(env.get("ANOMALY_MIN_EXTRA_WH")) or 1000.0
         mb = parse_price(env.get("ANOMALY_MIN_BASELINE_WH")) or 500.0
         anoms, hist = find_anomalies(rows, now_ms, f, m, mb)
-        extra = anomaly_lines(anoms, hist, rows)
+        msg += "\n" + "\n".join(anomaly_lines(anoms, hist, rows))
     except Exception as e:
         errors.append(f"Elementkontroll misslyckades ({e})")
-    if extra:
-        msg += "\n" + "\n".join(extra)
     if errors:
         msg += "\n⚠ " + "; ".join(errors)
     print(msg)
@@ -411,9 +394,15 @@ def sample_devices(env):
     j = http_json(f"{ADAX}/rest/v1/content/?withEnergy=1",
                   headers={"Authorization": f"Bearer {token}"})
     rows = sample_rows(j, time.time() * 1000)
-    with open(samples_path(env), "a") as f:
+    path = samples_path(env)
+    with open(path, "a") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
+    try:
+        if os.path.getsize(path) > 1_000_000:
+            prune_samples(env, time.time() * 1000)
+    except OSError:
+        pass
 
 
 DAY_MS = 24 * 3600 * 1000
@@ -440,6 +429,46 @@ def load_samples(env, now_ms, days=9):
     except OSError:
         pass
     return rows
+
+
+def own_energy(rows, start_ms, now_ms, room=None, min_cover=0.5):
+    """Wh i [start, nu) ur egna prover, eller None om täckningen är för tunn.
+
+    Varje prov är elementets energi senaste timmen, så medelvärdet av proven
+    gånger antalet timmar ger energin över perioden. Kräver prover nära både
+    start och slut och minst hälften av de förväntade provtagningarna."""
+    by = {}
+    for r in rows:
+        if start_ms <= r["t"] < now_ms and (room is None or r.get("room") == room):
+            by.setdefault(r["id"], []).append((r["t"], r["wh"]))
+    hours = (now_ms - start_ms) / 3_600_000
+    if not by or hours <= 0:
+        return None
+    ts = [t for v in by.values() for t, _ in v]
+    if min(ts) - start_ms > 2 * 3_600_000 or now_ms - max(ts) > 2 * 3_600_000:
+        return None
+    expected = (now_ms - start_ms) / 1000 / SAMPLE_EVERY
+    if max(len(v) for v in by.values()) < min_cover * expected:
+        return None
+    return sum(sum(w for _, w in v) / len(v) for v in by.values()) * hours
+
+
+def prune_samples(env, now_ms, keep_days=14):
+    """Tar bort prover äldre än keep_days (atomiskt)."""
+    path = samples_path(env)
+    cutoff = now_ms - keep_days * DAY_MS
+    kept = []
+    with open(path) as f:
+        for line in f:
+            try:
+                if json.loads(line)["t"] >= cutoff:
+                    kept.append(line if line.endswith("\n") else line + "\n")
+            except (ValueError, KeyError, TypeError):
+                continue
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(kept)
+    os.replace(tmp, path)
 
 
 def window_stats(rows, lo, hi):
@@ -525,15 +554,18 @@ def seconds_until_next(now=None):
     if nxt <= now:
         nxt = (nxt + dt.timedelta(days=1)).replace(
             hour=SEND_AT.hour, minute=SEND_AT.minute)
-    return (nxt - now).total_seconds()
+    # timestamp() tar hänsyn till sommartidsbyte; (nxt - now) gör det inte.
+    return nxt.timestamp() - now.timestamp()
 
 
 def debug_energy(env):
-    """Skriver ut Adax rå energy_log (utan hemligheter) för felsökning."""
+    """Rå energy_log per rum, samt jämförelse mellan Adax dygnssumma och
+    egna prover för senaste avslutade dygnet (validerar own_energy)."""
     token = adax_token(env)
     now_ms = time.time() * 1000
     start = window_start()
     state = load_state(env)
+    rows = load_samples(env, now_ms)
     for r in adax_content(token).get("rooms", []):
         pts = adax_points(token, r["id"])
         res = energy_since(pts, start, now_ms, state.get(str(r["id"]), []))
@@ -541,6 +573,14 @@ def debug_energy(env):
               f"sedan_start_Wh={res[0]:.0f} uppskattat={res[1]} nu={res[2]}")
         for p in (pts[:2] + pts[-2:]) if pts else []:
             print("   ", p)
+        done = [p for p in pts if int(p["toTime"]) <= now_ms]
+        if done:
+            last = max(done, key=lambda p: int(p["toTime"]))
+            own = own_energy(rows, int(last["fromTime"]), int(last["toTime"]),
+                             room=r["id"])
+            print(f"    senaste avslutade dygn: Adax={last['energyWh']} Wh, "
+                  f"egna prover={'saknas' if own is None else f'{own:.0f} Wh'}")
+    print(f"egen energi sedan start (alla rum): {own_energy(rows, start, now_ms)}")
     print(f"start_ms={start} nu_ms={int(now_ms)} tillstånd={state_path(env)}")
 
 

@@ -149,14 +149,6 @@ def test_energy_line_flags_missing_price():
     assert o.energy_line(5200, None).endswith("(elpris ej inställt)")
 
 
-def test_covered_ms_detects_missing_day():
-    # Gårdagens dygn saknas: bara dagens dygn finns -> täckning = nu - dagens start.
-    pts = [{"fromTime": TODAY, "toTime": TODAY + D, "energyWh": 5}]
-    assert o.covered_ms(pts, START, NOW) == NOW - TODAY
-    full = pts + [{"fromTime": YEST, "toTime": TODAY, "energyWh": 5}]
-    assert o.covered_ms(full + full, START, NOW) == NOW - START  # dubbletter ok
-
-
 def test_energy_line_has_no_obs_text():
     line = o.energy_line(5200, 1.0, None, None, estimated=False)
     assert "OBS" not in line
@@ -240,7 +232,7 @@ def test_load_samples_skips_bad_and_dupes():
 
 
 def test_energy_line_has_no_spot_line():
-    assert "Snittspot" not in o.energy_line(1000, 1.0, None, None, note="x")
+    assert "Snittspot" not in o.energy_line(1000, 1.0, None, None)
 
 
 def test_idle_baseline_is_not_flagged_as_anomaly():
@@ -295,3 +287,166 @@ def test_http_json_4xx_is_not_retried():
         assert calls["n"] == 1
     finally:
         urllib.request.urlopen = orig
+
+
+# ---------- sommartid ----------
+
+def test_next_send_correct_across_dst_changes():
+    for now, nxt in [
+            (dt.datetime(2026, 10, 24, 7, 40, tzinfo=o.TZ),   # 25 h-dygn (hösten)
+             dt.datetime(2026, 10, 25, 7, 30, tzinfo=o.TZ)),
+            (dt.datetime(2027, 3, 27, 7, 40, tzinfo=o.TZ),    # 23 h-dygn (våren)
+             dt.datetime(2027, 3, 28, 7, 30, tzinfo=o.TZ))]:
+        assert o.seconds_until_next(now) == nxt.timestamp() - now.timestamp()
+
+
+# ---------- egen energi från prover ----------
+
+SAMPLE = o.SAMPLE_EVERY * 1000
+
+
+def _samples(n_hours, per_element, end=NOW, room=None):
+    """Prov var 15:e minut bakåt i n_hours; per_element = {id: wh}."""
+    rows, t = [], end - 1000
+    while t > end - n_hours * H:
+        for i, wh in per_element.items():
+            rows.append({"t": t, "id": i, "et": t, "wh": float(wh),
+                         "room": room if room is not None else i // 10})
+        t -= SAMPLE
+    return rows
+
+
+def test_own_energy_is_mean_times_hours():
+    rows = _samples(26, {11: 100, 12: 50})
+    # 24 h, två element: (100 + 50) Wh/h * 24 h = 3600 Wh
+    assert abs(o.own_energy(rows, NOW - 24 * H, NOW) - 3600) < 1e-6
+
+
+def test_own_energy_filters_room():
+    rows = _samples(26, {11: 100, 21: 50})
+    assert abs(o.own_energy(rows, NOW - 24 * H, NOW, room=1) - 2400) < 1e-6
+
+
+def test_own_energy_none_when_coverage_thin():
+    short = _samples(5, {11: 100})                  # bara 5 h data
+    assert o.own_energy(short, NOW - 24 * H, NOW) is None
+    assert o.own_energy([], NOW - 24 * H, NOW) is None
+    sparse = [r for k, r in enumerate(_samples(26, {11: 100})) if k % 8 == 0]
+    assert o.own_energy(sparse, NOW - 24 * H, NOW) is None   # < 50 % av proven
+
+
+def test_prune_samples_keeps_recent_only():
+    import tempfile, os, json
+    d = tempfile.mkdtemp()
+    env = {"TEMPWATCH_STATE": os.path.join(d, "s.json")}
+    path = os.path.join(d, "devices.jsonl")
+    with open(path, "w") as f:
+        for age_days in (20, 15, 13, 1):
+            f.write(json.dumps({"t": NOW - age_days * D, "id": 1}) + "\n")
+        f.write("trasig\n")
+    o.prune_samples(env, NOW, keep_days=14)
+    kept = [json.loads(x)["t"] for x in open(path)]
+    assert kept == [NOW - 13 * D, NOW - 1 * D]
+
+
+# ---------- Telegram ----------
+
+def test_telegram_send_retries_via_http_json():
+    calls = []
+    def fake(url, data=None, headers=None, timeout=20, retries=2):
+        calls.append((url, data, retries))
+        return {"ok": True}
+    orig = o.http_json
+    o.http_json = fake
+    try:
+        o.telegram_send({"TELEGRAM_TOKEN": " tok ", "TELEGRAM_CHAT_ID": "42"},
+                        "Rubrik\nA < B")
+    finally:
+        o.http_json = orig
+    url, data, retries = calls[0]
+    assert url == "https://api.telegram.org/bottok/sendMessage"
+    assert data["chat_id"] == "42" and data["parse_mode"] == "HTML"
+    assert data["text"] == "<b>Rubrik</b>\nA &lt; B" and retries >= 3
+
+
+def test_telegram_send_requires_credentials():
+    try:
+        o.telegram_send({}, "x")
+        assert False
+    except RuntimeError as e:
+        assert "saknas" in str(e)
+
+
+# ---------- hela flödet med mockade anrop ----------
+
+def _run(env, samples, adax_down=False, eco_down=False):
+    """Kör run_once med mockade nätverksanrop. Returnerar (meddelande, anrop)."""
+    import tempfile, os, json, io, contextlib
+    d = tempfile.mkdtemp()
+    env = {**env, "TEMPWATCH_STATE": os.path.join(d, "s.json")}
+    with open(os.path.join(d, "devices.jsonl"), "w") as f:
+        for r in samples:
+            f.write(json.dumps(r) + "\n")
+    calls = []
+    saved = {k: getattr(o, k) for k in (
+        "ecowitt_temps", "adax_token", "adax_content", "adax_points",
+        "spot_average", "telegram_send", "window_start")}
+    def eco(e):
+        if eco_down: raise RuntimeError("nere")
+        return (-6.0, 16.6)
+    def tok(e):
+        if adax_down: raise RuntimeError("nere")
+        return "T"
+    o.ecowitt_temps = eco
+    o.adax_token = tok
+    o.adax_content = lambda t: {"rooms": [
+        {"id": 1, "name": "Kök", "heatingEnabled": True, "temperature": 1680,
+         "targetTemperature": 1800}]}
+    o.adax_points = lambda t, r: (calls.append("adax_points") or [])
+    o.spot_average = lambda a, s, n: 0.10
+    o.telegram_send = lambda e, text: calls.append(("send", text))
+    o.window_start = lambda now=None: int(NOW_REAL - 24 * H)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            o.run_once(env, dry=False)
+    finally:
+        for k, v in saved.items():
+            setattr(o, k, v)
+    sent = [c[1] for c in calls if isinstance(c, tuple)]
+    return sent[0], calls
+
+
+import time as _time
+NOW_REAL = _time.time() * 1000
+PRICE_ENV = {"ELECTRICITY_AREA": "SE2", "ELECTRICITY_ADDON_SEK_PER_KWH": "0,6789"}
+
+
+def test_run_once_uses_own_samples_and_skips_adax_energy_log():
+    rows = _samples(26, {11: 100, 12: 50}, end=int(NOW_REAL), room=1)
+    msg, calls = _run(PRICE_ENV, rows)
+    lines = msg.splitlines()
+    assert lines[:3] == ["Offerberg temp", "Utomhus: -6,0 °C", "Inomhus (köket): 16,6 °C"]
+    assert "  Kök: 16,8 °C (mål 18 °C)" in lines
+    # 150 Wh/h * 24 h = 3,6 kWh * (0,10 + 0,6789) * 1,25 = 3,505 kr -> 3,51
+    assert any(l.startswith("Energiförbrukning sedan igår") and "3,6 kWh (≈ 3,51 kr)" in l
+               and "uppskattat" not in l for l in lines)
+    assert "adax_points" not in calls          # inga energy_log-anrop behövs
+    assert not any("⚠" in l and "otillgänglig" in l for l in lines)
+
+
+def test_run_once_falls_back_to_adax_when_samples_missing():
+    msg, calls = _run(PRICE_ENV, [])
+    assert "adax_points" in calls
+    assert "Elementkontroll: samlar data" in msg
+
+
+def test_run_once_energy_survives_adax_outage():
+    rows = _samples(26, {11: 100}, end=int(NOW_REAL), room=1)
+    msg, _ = _run(PRICE_ENV, rows, adax_down=True)
+    assert "Energiförbrukning" in msg and "Adax otillgänglig" in msg
+    assert "okänt" in msg                       # rummen är okända
+
+
+def test_run_once_sends_when_everything_is_down():
+    msg, _ = _run({}, [], adax_down=True, eco_down=True)
+    assert msg.startswith("Offerberg temp") and "Ecowitt otillgänglig" in msg
