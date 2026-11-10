@@ -506,3 +506,85 @@ def test_minute_bins_shows_sawtooth():
     b = o.minute_bins(rows)
     assert [round(v[1]) for v in b.values()] == [1, 16, 31, 46]
     assert list(b) == ["00-14", "15-29", "30-44", "45-59"]
+
+
+# ---------- frostlarm ----------
+
+def test_decide_alert_lifecycle():
+    n, h = 1_000_000_000_000, 3_600_000
+    act, st = o.decide_alert(9.5, {}, n, below=8)
+    assert act is None and st == {}                       # varmt: inget
+    act, st = o.decide_alert(7.4, st, n, below=8)
+    assert act == "alarm" and st["active"] and st["min"] == 7.4
+    act, st = o.decide_alert(6.9, st, n + h, below=8)     # fortfarande kallt, för tidigt
+    assert act is None and st["min"] == 6.9
+    act, st = o.decide_alert(7.0, st, n + 6 * h, below=8)
+    assert act == "remind" and st["last_sent"] == n + 6 * h
+    act, st = o.decide_alert(8.4, st, n + 7 * h, below=8)  # över gränsen men inom hysteres
+    assert act is None and st["active"]
+    act, st = o.decide_alert(9.1, st, n + 8 * h, below=8)
+    assert act == "clear" and st == {"active": False, "min": 6.9}
+    assert o.decide_alert(9.3, st, n + 9 * h, below=8)[0] is None   # ingen ny signal
+
+
+def _frost_env():
+    import tempfile, os
+    d = tempfile.mkdtemp()
+    return {"TEMPWATCH_STATE": os.path.join(d, "s.json"),
+            "TELEGRAM_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}
+
+
+def test_check_frost_sends_once_then_clears():
+    env = _frost_env()
+    sent, temps = [], [(-6.0, 7.5)]
+    orig_e, orig_t = o.ecowitt_temps, o.telegram_send
+    o.ecowitt_temps = lambda e: temps[0]
+    o.telegram_send = lambda e, text: sent.append(text)
+    try:
+        n = 1_000_000_000_000
+        assert o.check_frost(env, now_ms=n) == "alarm"
+        assert o.check_frost(env, now_ms=n + 15 * 60000) is None      # ingen spam
+        temps[0] = (-4.0, 9.2)
+        assert o.check_frost(env, now_ms=n + 3_600_000) == "clear"
+    finally:
+        o.ecowitt_temps, o.telegram_send = orig_e, orig_t
+    assert len(sent) == 2
+    assert sent[0].startswith("⚠ Frostlarm") and "7,5 °C" in sent[0] and "Utomhus: -6,0 °C" in sent[0]
+    assert sent[1].startswith("✅") and "7,5 °C" in sent[1]
+
+
+def test_check_frost_retries_after_failed_send():
+    env = _frost_env()
+    calls = {"n": 0}
+    def flaky(e, text):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Telegram nere")
+    orig_e, orig_t = o.ecowitt_temps, o.telegram_send
+    o.ecowitt_temps = lambda e: (-6.0, 5.0)
+    o.telegram_send = flaky
+    try:
+        n = 1_000_000_000_000
+        try:
+            o.check_frost(env, now_ms=n)
+            assert False
+        except RuntimeError:
+            pass
+        assert o.check_frost(env, now_ms=n + 900_000) == "alarm"   # nytt försök, inte tyst
+    finally:
+        o.ecowitt_temps, o.telegram_send = orig_e, orig_t
+
+
+def test_check_frost_threshold_from_env_and_dry_run_does_not_send():
+    env = {**_frost_env(), "ALERT_INDOOR_BELOW_C": "5,5"}
+    sent = []
+    orig_e, orig_t = o.ecowitt_temps, o.telegram_send
+    o.ecowitt_temps = lambda e: (-6.0, 7.0)
+    o.telegram_send = lambda e, text: sent.append(text)
+    try:
+        assert o.check_frost(env, now_ms=1) is None          # 7 > 5,5
+        env["ALERT_INDOOR_BELOW_C"] = "8"
+        assert o.check_frost(env, dry=True, now_ms=1) == "alarm"
+    finally:
+        o.ecowitt_temps, o.telegram_send = orig_e, orig_t
+    assert sent == []

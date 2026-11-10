@@ -12,6 +12,9 @@ kontroll av element. Endast Python 3.12 och standardbiblioteket.
 - **Energin** "sedan igår 07:30" = summan av timmarnas största värde (pågående timme: hittills).
   Några timmar utan prov fylls med medelvärde (`– uppskattat`); saknas fler används Adax
   dygnspunkter, som ibland saknar hela dygn.
+- **Frostlarm:** vid varje provtagning kontrolleras Ecowitts inomhussensor. Under 8 °C
+  skickas ett larm direkt i Telegram (gräns `ALERT_INDOOR_BELOW_C`), en påminnelse var 6:e timme
+  medan det är kallt, och ett besked när temperaturen är 1 °C över gränsen igen.
 - **Elkostnad** = energi × (medelspotpris i elområdet + påslag) × (1 + moms).
 - **Elementkontroll** jämför varje element med sitt eget normalläge (kräver 3 dygn data).
 
@@ -28,6 +31,7 @@ cd tempwatch && docker compose up -d --build
 
 ## Kommandon
 ```bash
+docker compose run --rm tempwatch python tempwatch.py --check-frost --dry-run  # visa frostläget, skicka inte
 docker compose run --rm tempwatch python tempwatch.py --dry-run   # visa, skicka inte
 docker compose run --rm tempwatch python tempwatch.py --once      # skicka nu
 docker compose run --rm tempwatch python tempwatch.py --debug-price    # prisinställningar och spotpris
@@ -50,4 +54,5 @@ Alla externa anrop mockas; inga nycklar behövs. CI kör samma tester vid varje 
 - Adax `energy_log` saknar ibland hela dygn, därför är de egna proverna primär källa.
 - Medelspotpriset är ett oviktat medelvärde över perioden, inte viktat mot när elementen drog.
 - Elementkontrollen kan inte avgöra om förbrukningen beror på ändrad måltemperatur eller väder.
+- Frostlarmet har ingen vakthund: om Ecowitt, nätet eller containern slutar fungera uteblir larmet.
 - Styrning av elementen via Telegram är inte byggd.

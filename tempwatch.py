@@ -7,6 +7,7 @@ Körning:
   python tempwatch.py --once      # skicka direkt en gång
   python tempwatch.py --dry-run   # skriv ut meddelandet, skicka inte
   python tempwatch.py             # loop: skickar kl 07:30 och loggar element var 15:e minut
+Frostlarm: --check-frost [--dry-run]
 Felsökning: --debug-price, --debug-devices, --debug-energy, --debug-semantics
 """
 import argparse
@@ -608,6 +609,76 @@ def anomaly_lines(anoms, history, rows):
     return out
 
 
+def alert_path(env):
+    return os.path.join(os.path.dirname(state_path(env)), "alert.json")
+
+
+def decide_alert(temp, state, now_ms, below, hyst=1.0, repeat_h=6.0):
+    """Frostlarmets tillstånd. Returnerar (åtgärd, nytt tillstånd).
+
+    alarm: första gången temperaturen är under gränsen. remind: fortfarande
+    under gränsen efter repeat_h timmar. clear: åter över gränsen + hyst
+    (hysteres så att larmet inte pendlar vid gränsen)."""
+    active = state.get("active", False)
+    if temp < below:
+        if not active:
+            return "alarm", {"active": True, "since": now_ms,
+                             "last_sent": now_ms, "min": temp}
+        new = {**state, "min": min(state.get("min", temp), temp)}
+        if now_ms - state.get("last_sent", 0) >= repeat_h * 3_600_000:
+            return "remind", {**new, "last_sent": now_ms}
+        return None, new
+    if active and temp >= below + hyst:
+        return "clear", {"active": False, "min": state.get("min", temp)}
+    return None, state
+
+
+def alert_text(action, temp, outdoor, below, state, now=None):
+    now = now or dt.datetime.now(TZ)
+    if action == "clear":
+        return (f"✅ Offerberg: inomhus igen {fmt(temp)}\n"
+                f"Lägsta under larmet: {fmt(state.get('min', temp))}.")
+    since = ""
+    if action == "remind" and state.get("since"):
+        s0 = dt.datetime.fromtimestamp(state["since"] / 1000, TZ)
+        since = f" (sedan {s0:%d/%m %H:%M})"
+    head = "⚠ Frostlarm Offerberg" if action == "alarm" else "⚠ Fortfarande kallt Offerberg"
+    return (f"{head}\nInomhus (köket): {fmt(temp)} – under {fmt_target(below)}{since}.\n"
+            f"Utomhus: {fmt(outdoor)}")
+
+
+def check_frost(env, dry=False, now_ms=None):
+    """Kontrollerar Ecowitts inomhussensor; larmar via Telegram vid för låg temperatur.
+
+    Skickar först och sparar tillståndet efter, så ett misslyckat utskick
+    försöks igen nästa provtagning."""
+    now_ms = now_ms if now_ms is not None else time.time() * 1000
+    below = parse_price(env.get("ALERT_INDOOR_BELOW_C"))
+    below = 8.0 if below is None else below
+    hyst = parse_price(env.get("ALERT_HYSTERESIS_C"))
+    hyst = 1.0 if hyst is None else hyst
+    repeat = parse_price(env.get("ALERT_REPEAT_HOURS"))
+    repeat = 6.0 if repeat is None else repeat
+    outdoor, indoor = ecowitt_temps(env)
+    try:
+        with open(alert_path(env)) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    action, new = decide_alert(indoor, state, now_ms, below, hyst, repeat)
+    if dry:
+        print(f"inomhus {fmt(indoor)}, gräns {fmt_target(below)}, åtgärd: {action}")
+        return action
+    if action:
+        telegram_send(env, alert_text(action, indoor, outdoor, below, new))
+    if new != state:
+        tmp = alert_path(env) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(new, f)
+        os.replace(tmp, alert_path(env))
+    return action
+
+
 def seconds_until_next(now=None):
     now = now or dt.datetime.now(TZ)
     nxt = now.replace(hour=SEND_AT.hour, minute=SEND_AT.minute,
@@ -726,11 +797,15 @@ def main():
     ap.add_argument("--debug-price", action="store_true")
     ap.add_argument("--debug-devices", action="store_true")
     ap.add_argument("--debug-semantics", action="store_true")
+    ap.add_argument("--check-frost", action="store_true")
     ap.add_argument("--debug-energy", action="store_true")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     env = os.environ
+    if a.check_frost:
+        check_frost(env, dry=a.dry_run)
+        return
     if a.debug_semantics:
         debug_semantics(env)
         return
@@ -756,6 +831,10 @@ def main():
                 sample_devices(env)
             except Exception as e:  # provtagning får aldrig stoppa notisen
                 print(f"Provtagning misslyckades: {e}", file=sys.stderr)
+            try:
+                check_frost(env)
+            except Exception as e:
+                print(f"Frostkontroll misslyckades: {e}", file=sys.stderr)
             next_sample = next_sample_time(time.time())
         if now >= next_send:
             try:
