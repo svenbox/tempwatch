@@ -695,3 +695,142 @@ def test_ping_ignores_failures_and_empty_url():
         o.ping("https://hc-ping.example/abc")
     finally:
         urllib.request.urlopen = orig
+
+
+# ---------- granskning 2: rättningar ----------
+
+def _fresh_ecowitt(outdoor, indoor):
+    import time as _t
+    ts = str(int(_t.time()))
+    return lambda e: {"outdoor": {"temperature": {"value": outdoor, "time": ts}},
+                      "indoor": {"temperature": {"value": indoor, "time": ts}}}
+
+
+def test_dead_outdoor_sensor_does_not_blind_frost_alarm():
+    env, sent = _frost_env(), []
+    orig_r, orig_t = o.ecowitt_raw, o.telegram_send
+    o.ecowitt_raw, o.telegram_send = _fresh_ecowitt("--", "5.0"), lambda e, t: sent.append(t)
+    try:
+        assert o.check_frost(env) == "alarm"
+    finally:
+        o.ecowitt_raw, o.telegram_send = orig_r, orig_t
+    assert len(sent) == 1 and sent[0].startswith("⚠ Frostlarm Offerberg")
+    assert "Inomhus (köket): 5,0 °C" in sent[0] and "Utomhus: okänt" in sent[0]
+
+
+def test_dead_indoor_sensor_triggers_watchdog_not_frost():
+    orig_r = o.ecowitt_raw
+    o.ecowitt_raw = _fresh_ecowitt("-3.0", "--")
+    try:
+        try:
+            o.ecowitt_reading({})
+            assert False
+        except RuntimeError as e:
+            assert "inomhussensorn" in str(e)
+    finally:
+        o.ecowitt_raw = orig_r
+
+
+def test_invalid_alert_setting_falls_back_to_default_and_is_reported():
+    env, sent = {**_frost_env(), "ALERT_INDOOR_BELOW_C": "8 C"}, []
+    orig_e, orig_t = o.ecowitt_reading, o.telegram_send
+    o.ecowitt_reading, o.telegram_send = (lambda e: (-6.0, 7.0, None)), (lambda e, t: sent.append(t))
+    try:
+        assert o.check_frost(env) == "alarm"          # standardgränsen 8 °C används
+    finally:
+        o.ecowitt_reading, o.telegram_send = orig_e, orig_t
+    assert o.config_warnings(env) == ["ogiltig inställning ALERT_INDOOR_BELOW_C='8 C'"]
+    assert o.config_warnings({"ALERT_INDOOR_BELOW_C": "7,5"}) == []
+
+
+def test_run_once_reports_invalid_setting():
+    msg, _ = _run({**PRICE_ENV, "ANOMALY_FACTOR": "x"}, [])
+    assert "ogiltig inställning ANOMALY_FACTOR='x'" in msg
+
+
+def test_heartbeat_only_when_frost_check_succeeds():
+    pings = []
+    saved = {k: getattr(o, k) for k in ("sample_devices", "check_frost", "ping")}
+    o.sample_devices = lambda e: None
+    o.ping = lambda url: pings.append(url)
+    try:
+        o.check_frost = lambda e: None
+        assert o.sample_cycle({"HEARTBEAT_URL": "u"}) is True and pings == ["u"]
+        def boom(e):
+            raise RuntimeError("Telegram nere")
+        o.check_frost = boom
+        assert o.sample_cycle({"HEARTBEAT_URL": "u"}) is False and pings == ["u"]
+    finally:
+        for k, v in saved.items():
+            setattr(o, k, v)
+
+
+def test_rooms_kept_when_ecowitt_down():
+    msg, _ = _run(PRICE_ENV, [], eco_down=True)
+    assert "Utomhus: okänt" in msg and "Inomhus (köket): okänt" in msg
+    assert "  Kök: 16,8 °C (mål 18 °C)" in msg and "Ecowitt otillgänglig" in msg
+
+
+def test_samples_without_energytime_are_not_collapsed():
+    import tempfile, os, json
+    d = tempfile.mkdtemp()
+    env = {"TEMPWATCH_STATE": os.path.join(d, "s.json")}
+    with open(os.path.join(d, "devices.jsonl"), "w") as f:
+        for k in range(10):
+            f.write(json.dumps({"t": NOW - k * 900_000, "id": 1, "wh": k, "et": None}) + "\n")
+        f.write(json.dumps({"t": NOW, "id": 2, "wh": 1, "et": 5}) + "\n")
+        f.write(json.dumps({"t": NOW, "id": 2, "wh": 1, "et": 5}) + "\n")   # riktig dubblett
+    assert len(o.load_samples(env, NOW + 1)) == 11
+
+
+def test_should_catch_up():
+    import datetime as dt
+    d = lambda h, m: dt.datetime(2026, 11, 14, h, m, tzinfo=o.TZ)
+    assert o.should_catch_up(d(8, 15), "2026-11-13") is True
+    assert o.should_catch_up(d(8, 15), "2026-11-14") is False     # redan skickad
+    assert o.should_catch_up(d(7, 15), "2026-11-13") is False     # före 07:30
+    assert o.should_catch_up(d(13, 0), "2026-11-13") is False     # för sent
+    assert o.should_catch_up(d(8, 15), None) is False             # okänt: gissa inte
+
+
+def test_run_once_records_send_date():
+    import json, os, tempfile
+    d = tempfile.mkdtemp()
+    env = {**PRICE_ENV, "TEMPWATCH_STATE": os.path.join(d, "s.json")}
+    saved = {k: getattr(o, k) for k in ("ecowitt_temps", "adax_token", "telegram_send", "load_samples")}
+    o.ecowitt_temps = lambda e: (1.0, 2.0)
+    o.adax_token = lambda e: (_ for _ in ()).throw(RuntimeError("nere"))
+    o.telegram_send = lambda e, t: None
+    o.load_samples = lambda e, n: []
+    try:
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            o.run_once(env)
+    finally:
+        for k, v in saved.items():
+            setattr(o, k, v)
+    import datetime as dt
+    got = json.load(open(os.path.join(d, "notice.json")))
+    assert got == {"last_date": dt.datetime.now(o.TZ).date().isoformat()}
+
+
+def test_unwritable_state_does_not_spam_frost_alarm():
+    env = {"TEMPWATCH_STATE": "/finns/inte/s.json", "TELEGRAM_TOKEN": "t", "TELEGRAM_CHAT_ID": "1"}
+    sent = []
+    orig_e, orig_t = o.ecowitt_reading, o.telegram_send
+    o.ecowitt_reading, o.telegram_send = (lambda e: (-6.0, 5.0, None)), (lambda e, t: sent.append(t))
+    try:
+        n = 1_800_000_000_000
+        assert o.check_frost(env, now_ms=n) == "alarm"
+        assert o.check_frost(env, now_ms=n + 900_000) is None    # inget nytt larm
+    finally:
+        o.ecowitt_reading, o.telegram_send = orig_e, orig_t
+        o._MEM.clear(); o._SAVE_FAILED.clear()
+    assert len(sent) == 1
+
+
+def test_window_energy_lists_missing_hours():
+    rows = [r for r in _saw(26, {11: 100})
+            if not (NOW - 12 * HOUR <= r["t"] < NOW - 11 * HOUR)]
+    r = o.window_energy(o.hourly_totals(rows)[11], NOW - 24 * HOUR, NOW)
+    assert r["missing_at"] == [int((NOW - 12 * HOUR) // HOUR)]

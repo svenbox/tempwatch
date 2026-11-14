@@ -78,12 +78,26 @@ def epoch_ms(v):
     return int(x if x > 1e12 else x * 1000) if x > 0 else None
 
 
+def to_float(v):
+    """Tal ur Ecowitt-värde, None om sensorn inte svarar (t.ex. '--')."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def ecowitt_reading(env):
-    """(utomhus °C, inomhus °C, inomhusmätningens tid i ms | None)."""
+    """(utomhus °C | None, inomhus °C, inomhusmätningens tid i ms | None).
+
+    Inomhus krävs (frostlarmet bygger på den). Utomhus är valfri: en död
+    utomhussensor får inte göra frostlarmet blint."""
     d = ecowitt_raw(env)
     ind = d["indoor"]["temperature"]
-    return (float(d["outdoor"]["temperature"]["value"]),
-            float(ind["value"]), epoch_ms(ind.get("time")))
+    indoor = to_float(ind.get("value"))
+    if indoor is None:
+        raise RuntimeError(f"inomhussensorn ger inget värde ({ind.get('value')!r})")
+    outdoor = to_float(((d.get("outdoor") or {}).get("temperature") or {}).get("value"))
+    return outdoor, indoor, epoch_ms(ind.get("time"))
 
 
 def ecowitt_temps(env):
@@ -243,6 +257,35 @@ def price_per_kwh(env, start_ms, now_ms):
     return parse_price(env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
 
 
+NUMERIC_SETTINGS = (
+    "ELECTRICITY_ADDON_SEK_PER_KWH", "ELECTRICITY_VAT", "ELECTRICITY_PRICE_SEK_PER_KWH",
+    "ANOMALY_FACTOR", "ANOMALY_MIN_EXTRA_WH", "ANOMALY_MIN_BASELINE_WH",
+    "ALERT_INDOOR_BELOW_C", "ALERT_HYSTERESIS_C", "ALERT_REPEAT_HOURS",
+    "ALERT_STALE_MINUTES", "ALERT_FAIL_CHECKS", "ALERT_WATCH_REPEAT_HOURS")
+
+
+def env_num(env, key, default):
+    """Tal ur inställning; standardvärdet om den saknas eller är felskriven."""
+    try:
+        v = parse_price(env.get(key))
+    except ValueError:
+        print(f"Ogiltig inställning {key}={env.get(key)!r}; använder {default}",
+              file=sys.stderr)
+        return default
+    return default if v is None else v
+
+
+def config_warnings(env):
+    """Felskrivna talinställningar, som rader till morgonnotisen."""
+    out = []
+    for k in NUMERIC_SETTINGS:
+        try:
+            parse_price(env.get(k))
+        except ValueError:
+            out.append(f"ogiltig inställning {k}={clean(env.get(k))!r}")
+    return out
+
+
 def parse_price(v):
     """Pris per kWh i kr, t.ex. '1,25' eller '1.25'. None om inte angivet."""
     v = clean(v or "").replace(",", ".")
@@ -258,7 +301,7 @@ def heating_rooms(j):
 
 
 def fmt(v):
-    return f"{v:.1f}".replace(".", ",") + " °C"
+    return "okänt" if v is None else f"{v:.1f}".replace(".", ",") + " °C"
 
 
 def fmt_target(v):
@@ -379,26 +422,31 @@ def run_once(env, dry=False):
         energy = energy_line(wh, price, start, estimated=est)
     except Exception as e:
         errors.append(f"Energi otillgänglig ({e})")
-    if eco:
-        msg = build_message(*eco, rooms or [], energy)
-        if rooms is None:
-            msg = msg.replace("Dessa rum har värme på:\n  (inga)",
-                              "Dessa rum har värme på: okänt")
-    else:
-        msg = "\n".join([TITLE] + ([energy] if energy else []))
+    outdoor, indoor = eco if eco else (None, None)
+    msg = build_message(outdoor, indoor, rooms or [], energy)
+    if rooms is None:
+        msg = msg.replace("Dessa rum har värme på:\n  (inga)",
+                          "Dessa rum har värme på: okänt")
     try:
-        f = parse_price(env.get("ANOMALY_FACTOR")) or 1.5
-        m = parse_price(env.get("ANOMALY_MIN_EXTRA_WH")) or 1000.0
-        mb = parse_price(env.get("ANOMALY_MIN_BASELINE_WH")) or 500.0
-        anoms, hist = find_anomalies(rows, now_ms, f, m, mb)
+        anoms, hist = find_anomalies(
+            rows, now_ms, env_num(env, "ANOMALY_FACTOR", 1.5) or 1.5,
+            env_num(env, "ANOMALY_MIN_EXTRA_WH", 1000.0),
+            env_num(env, "ANOMALY_MIN_BASELINE_WH", 500.0))
         msg += "\n" + "\n".join(anomaly_lines(anoms, hist, rows))
     except Exception as e:
         errors.append(f"Elementkontroll misslyckades ({e})")
+    errors += config_warnings(env)
+    if _SAVE_FAILED:
+        errors.append("kan inte spara larmtillstånd i " + ", ".join(sorted(_SAVE_FAILED)))
     if errors:
         msg += "\n⚠ " + "; ".join(errors)
     print(msg)
     if not dry:
         telegram_send(env, msg)
+        try:
+            save_json(notice_path(env), {"last_date": dt.datetime.now(TZ).date().isoformat()})
+        except OSError as e:
+            print(f"Kan inte spara notisdatum: {e}", file=sys.stderr)
 
 
 def next_sample_time(now_s):
@@ -457,11 +505,14 @@ def load_samples(env, now_ms, days=9):
             for line in f:
                 try:
                     r = json.loads(line)
-                    key = (r["id"], r.get("et"))
-                    if r["t"] < now_ms - days * DAY_MS or key in seen:
+                    # Dubbletter (samma cachade Adax-värde) känns igen på energyTime;
+                    # saknas den kan inget avgöras, och raden behålls.
+                    key = (r["id"], r["et"]) if r.get("et") is not None else None
+                    if r["t"] < now_ms - days * DAY_MS or (key and key in seen):
                         continue
                     r["wh"] = float(r["wh"])
-                    seen.add(key)
+                    if key:
+                        seen.add(key)
                     rows.append(r)
                 except (ValueError, KeyError, TypeError):
                     continue
@@ -492,7 +543,7 @@ def window_energy(hours, start_ms, now_ms, ongoing=True):
     Timmar utan prov nära slutet av timmen fylls med elementets medel."""
     first_h, last_h = int(start_ms // HOUR_MS), int((now_ms - 1) // HOUR_MS)
     total = missing_frac = 0.0
-    observed, missing = [], 0
+    observed, missing, missing_at = [], 0, []
     for hh in range(first_h, last_h + 1):
         lo, hi = max(start_ms, hh * HOUR_MS), min(now_ms, (hh + 1) * HOUR_MS)
         frac = (hi - lo) / HOUR_MS
@@ -505,13 +556,14 @@ def window_energy(hours, start_ms, now_ms, ongoing=True):
         if v is None or v[1] < LATE_MINUTE:
             missing += 1
             missing_frac += frac
+            missing_at.append(hh)
             continue
         total += v[0] * frac
         observed.append(v[0])
     if missing_frac and observed:
         total += missing_frac * sum(observed) / len(observed)
     return {"wh": total, "est": missing > 0, "observed": len(observed),
-            "missing": missing,
+            "missing": missing, "missing_at": missing_at,
             "active": (sum(1 for x in observed if x > 0) / len(observed)
                        if observed else 0.0)}
 
@@ -699,7 +751,13 @@ def watch_text(action, kind, detail, state, now=None):
     return f"{head}\n{why}\nKontrollerna har misslyckats {n} gånger i rad."
 
 
+_MEM = {}            # senaste tillstånd i minnet, om filen inte går att skriva
+_SAVE_FAILED = set()
+
+
 def load_json(path):
+    if path in _MEM:
+        return _MEM[path]
     try:
         with open(path) as f:
             return json.load(f)
@@ -708,10 +766,37 @@ def load_json(path):
 
 
 def save_json(path, data):
+    _MEM[path] = data
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+        _SAVE_FAILED.discard(os.path.basename(path))
+    except OSError:
+        _SAVE_FAILED.add(os.path.basename(path))
+        raise
+
+
+def save_state_quietly(path, data):
+    """Sparar larmtillstånd; ett skrivfel får inte ge larm var 15:e minut."""
+    try:
+        save_json(path, data)
+    except OSError as e:
+        print(f"Kan inte spara {path}: {e}", file=sys.stderr)
+
+
+def notice_path(env):
+    return os.path.join(os.path.dirname(state_path(env)), "notice.json")
+
+
+def should_catch_up(now, last_date, until_hour=12):
+    """Skicka missad morgonnotis vid uppstart: efter 07:30, före until_hour, och
+    bara om vi vet att dagens inte är skickad (saknas filen gissar vi inte)."""
+    if not last_date:
+        return False
+    after_send = (now.hour, now.minute) >= (SEND_AT.hour, SEND_AT.minute)
+    return after_send and now.hour < until_hour and last_date != now.date().isoformat()
 
 
 def check_frost(env, dry=False, now_ms=None):
@@ -720,7 +805,7 @@ def check_frost(env, dry=False, now_ms=None):
     rapportera. Skickar först och sparar tillståndet efter, så ett misslyckat
     utskick försöks igen nästa provtagning. Returnerar frostlarmets åtgärd."""
     now_ms = now_ms if now_ms is not None else time.time() * 1000
-    num = lambda k, d: d if parse_price(env.get(k)) is None else parse_price(env.get(k))
+    num = lambda k, d: env_num(env, k, d)
     below, hyst, repeat = (num("ALERT_INDOOR_BELOW_C", 8.0),
                            num("ALERT_HYSTERESIS_C", 1.0), num("ALERT_REPEAT_HOURS", 6.0))
     stale_min, fail_limit = num("ALERT_STALE_MINUTES", 90.0), int(num("ALERT_FAIL_CHECKS", 3))
@@ -745,12 +830,12 @@ def check_frost(env, dry=False, now_ms=None):
             telegram_send(env, watch_text(w_action, kind, detail, w_new))
         except Exception:
             # Behåll räknaren men inte "larmat", så larmet försöks igen.
-            save_json(watch_path(env), {**w_new, "active": wstate.get("active", False),
-                                        "last_sent": wstate.get("last_sent", 0),
-                                        "since": wstate.get("since")})
+            save_state_quietly(watch_path(env), {**w_new, "active": wstate.get("active", False),
+                                                 "last_sent": wstate.get("last_sent", 0),
+                                                 "since": wstate.get("since")})
             raise
     if not dry and w_new != wstate:
-        save_json(watch_path(env), w_new)
+        save_state_quietly(watch_path(env), w_new)
     if kind != "ok":
         return None                      # föråldrad eller saknad data används inte
     # 3. Frostlarm
@@ -763,8 +848,25 @@ def check_frost(env, dry=False, now_ms=None):
     if action:
         telegram_send(env, alert_text(action, indoor, outdoor, below, new))
     if new != state:
-        save_json(alert_path(env), new)
+        save_state_quietly(alert_path(env), new)
     return action
+
+
+def sample_cycle(env):
+    """Provtagning, frostkontroll och hjärtslag. Hjärtslaget skickas bara om
+    frostkontrollen gick igenom (inklusive larmutskick), så att den externa
+    övervakningen larmar när frostlarmet inte fungerar."""
+    try:
+        sample_devices(env)
+    except Exception as e:  # provtagning får aldrig stoppa notisen
+        print(f"Provtagning misslyckades: {e}", file=sys.stderr)
+    try:
+        check_frost(env)
+    except Exception as e:
+        print(f"Frostkontroll misslyckades: {e}", file=sys.stderr)
+        return False
+    ping(env.get("HEARTBEAT_URL"))
+    return True
 
 
 def ping(url):
@@ -829,6 +931,12 @@ def debug_energy(env):
             print(f"    senaste avslutade dygn: Adax={last['energyWh']} Wh, "
                   f"egna prover={'saknas' if own is None else f'{own[0]:.0f} Wh'}")
     print(f"egen energi sedan start (alla rum): {own_energy(rows, start, now_ms)}")
+    names = {r["id"]: r.get("name") or r["id"] for r in rows}
+    for i, h in hourly_totals(rows).items():
+        miss = window_energy(h, start, now_ms)["missing_at"]
+        if miss:
+            when = ", ".join(f"{dt.datetime.fromtimestamp(x * 3600, TZ):%d/%m %H}:00" for x in miss)
+            print(f"  {names.get(i, i)}: timmar utan prov efter :{LATE_MINUTE} -> {when}")
     print(f"start_ms={start} nu_ms={int(now_ms)} tillstånd={state_path(env)}")
 
 
@@ -937,21 +1045,18 @@ def main():
     if a.once or a.dry_run:
         run_once(env, dry=a.dry_run)
         return
+    for w in config_warnings(env):
+        print(f"Varning: {w}", file=sys.stderr)
     next_send = time.time() + seconds_until_next()
+    if should_catch_up(dt.datetime.now(TZ), load_json(notice_path(env)).get("last_date")):
+        print("Dagens notis saknas: skickar den nu", file=sys.stderr)
+        next_send = time.time()
     next_sample = time.time()
     while True:
         time.sleep(max(min(next_send, next_sample) - time.time(), 0) + 0.5)
         now = time.time()
         if now >= next_sample:
-            try:
-                sample_devices(env)
-            except Exception as e:  # provtagning får aldrig stoppa notisen
-                print(f"Provtagning misslyckades: {e}", file=sys.stderr)
-            try:
-                check_frost(env)
-            except Exception as e:
-                print(f"Frostkontroll misslyckades: {e}", file=sys.stderr)
-            ping(env.get("HEARTBEAT_URL"))
+            sample_cycle(env)
             next_sample = next_sample_time(time.time())
         if now >= next_send:
             try:

@@ -5,7 +5,7 @@
 |---|---|
 | Kl 07:30 (svensk tid) | Notis till Telegram |
 | Minut :13, :28, :43, :58 | Provtagning av elementens energi, frostkontroll och vakthund, hjärtslag |
-| Vid uppstart | En provtagning direkt |
+| Vid uppstart | En provtagning direkt. Startar containern mellan 07:30 och 12:00 och dagens notis inte är skickad, skickas den direkt (kräver att `notice.json` finns, alltså att minst en notis skickats med den här versionen) |
 
 Sommartid hanteras: notisen kommer alltid kl 07:30 svensk tid.
 
@@ -27,7 +27,9 @@ Elementkontroll: inga avvikelser        eller en lista, eller "samlar data (x/3 
   spotpriset är ett oviktat medelvärde, och Adax visar inte när på dygnet elementen drog.
 - **Elementkontroll** jämför varje element med sitt eget normalläge de senaste dygnen. Element
   som varit nästan avstängda (under `ANOMALY_MIN_BASELINE_WH`) jämförs inte. Kräver 3 dygn data.
-- En `⚠`-rad betyder att en källa var otillgänglig. Notisen skickas ändå.
+- En `⚠`-rad betyder att en källa var otillgänglig, att en inställning är felskriven
+  (`ogiltig inställning X='…'`, standardvärdet används då), eller att larmtillstånd inte kan
+  sparas. Notisen skickas ändå.
 
 ## Larm
 | Larm | När | Efter |
@@ -35,8 +37,10 @@ Elementkontroll: inga avvikelser        eller en lista, eller "samlar data (x/3 
 | ⚠ Frostlarm | Ecowitts inomhussensor under `ALERT_INDOOR_BELOW_C` (8 °C) | Påminnelse var 6:e timme; ✅ när den är 1 °C över gränsen |
 | ⚠ Frostlarmet är blint | Ecowitt oläsligt 3 kontroller i rad, eller inomhusmätning äldre än 90 min | Påminnelse var 12:e timme; ✅ när det fungerar igen |
 
-Frostlarmet ignorerar föråldrad data. Ett larm som inte kunde skickas försöks igen vid nästa
-provtagning. **Larmen kommer inte fram om containern, servern, nätet eller Telegram är nere.** Sätt
+Frostlarmet bygger bara på inomhussensorn: en död utomhussensor visas som `Utomhus: okänt`
+men stoppar inte larmet. Frostlarmet ignorerar föråldrad data. Ett larm som inte kunde skickas försöks igen vid nästa
+provtagning. Hjärtslaget (`HEARTBEAT_URL`) skickas bara när frostkontrollen gick igenom,
+så den externa övervakningen larmar även när frostlarmet inte fungerar. **Larmen kommer inte fram om containern, servern, nätet eller Telegram är nere.** Sätt
 `HEARTBEAT_URL` till en extern övervakning (t.ex. healthchecks.io) för att upptäcka det.
 
 ## Filer och tillstånd (`/var/lib/tempwatch` → `/state`)
@@ -45,6 +49,7 @@ provtagning. **Larmen kommer inte fram om containern, servern, nätet eller Tele
 | `devices.jsonl` | Provlogg, en rad per element och provtagning. Rensas på rader äldre än 14 dygn |
 | `snapshots.json` | Reservdata för energi via Adax dygnspunkter |
 | `alert.json` | Frostlarmets tillstånd |
+| `notice.json` | Datum för senast skickade morgonnotis (för ersättningsnotis) |
 | `watch.json` | Vakthundens tillstånd |
 
 Katalogen ska ägas av `1000:1000`. Hemligheter ligger bara i `/etc/tempwatch/tempwatch.env`
@@ -63,8 +68,8 @@ docker compose run --rm tempwatch python tempwatch.py --debug-semantics # hur en
 docker compose run --rm tempwatch python tempwatch.py --debug-price   # prisinställningar och spotpris
 docker compose logs --tail 50                                        # fel från containern
 ```
-`docker compose up -d --build` startar om containern (efter `git pull`). Gör det inte efter
-kl 07:30 om du vill vara säker på dagens notis, eftersom en omstart då hoppar över den.
+`docker compose up -d --build` startar om containern (efter `git pull`). Var containern nere
+kl 07:30 skickas notisen när den startar, om det sker före 12:00.
 
 ## Provar du larmet?
 Sätt tillfälligt en gräns över rumstemperaturen och vänta en provtagning:
@@ -84,7 +89,8 @@ sudo sed -i '/^ALERT_INDOOR_BELOW_C=20$/d' /etc/tempwatch/tempwatch.env && docke
 | Ingen kostnad, `(elpris ej inställt)` | Varken `ELECTRICITY_AREA` eller `ELECTRICITY_PRICE_SEK_PER_KWH` satt | Se `.env.example` |
 | `Elementkontroll: samlar data (x/3 dygn)` | För lite provlogg | Vänta; kontrollera att `devices.jsonl` växer |
 | `Kan inte spara tillstånd` / ingen `devices.jsonl` | `/var/lib/tempwatch` saknas eller fel ägare | `sudo mkdir -p /var/lib/tempwatch && sudo chown 1000:1000 /var/lib/tempwatch` |
-| Ingen notis kl 07:30 | Containern stoppad eller omstartad efter 07:30 | `docker compose ps`, `docker compose logs --tail 50` |
+| Ingen notis kl 07:30 | Containern stoppad över 07:30 | `docker compose ps`, `docker compose logs --tail 50`; startas den före 12:00 skickas notisen i efterhand |
+| `– uppskattat` på energiraden | Någon timme saknar prov efter :40 | `--debug-energy` listar vilka timmar och element |
 | Energin ser dubbelt/halvt så stor ut som förväntat | Adax ändrat vad `energyWh` betyder | Kör `--debug-semantics` och `--debug-energy` |
 
 ## Underhåll
