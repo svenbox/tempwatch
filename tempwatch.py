@@ -8,6 +8,7 @@ Körning:
   python tempwatch.py --dry-run   # skriv ut meddelandet, skicka inte
   python tempwatch.py             # loop: skickar kl 07:30 och loggar element var 15:e minut
 Frostlarm: --check-frost [--dry-run]
+Övervakning: --test-heartbeat (HEARTBEAT_URL, HEARTBEAT_NOTICE_URL)
 Felsökning: --debug-ecowitt, --debug-price, --debug-devices, --debug-energy, --debug-semantics
 """
 import argparse
@@ -853,32 +854,70 @@ def check_frost(env, dry=False, now_ms=None):
 
 
 def sample_cycle(env):
-    """Provtagning, frostkontroll och hjärtslag. Hjärtslaget skickas bara om
-    frostkontrollen gick igenom (inklusive larmutskick), så att den externa
-    övervakningen larmar när frostlarmet inte fungerar."""
+    """Provtagning, frostkontroll och hjärtslag. Hjärtslaget signalerar fel
+    (/fail) när frostkontrollen inte gick igenom (inklusive larmutskick), så att
+    den externa övervakningen larmar när frostlarmet inte fungerar."""
+    notes = []
     try:
         sample_devices(env)
     except Exception as e:  # provtagning får aldrig stoppa notisen
         print(f"Provtagning misslyckades: {e}", file=sys.stderr)
+        notes.append(f"Adax-provtagning misslyckades: {e}")
     try:
-        check_frost(env)
+        action = check_frost(env)
     except Exception as e:
         print(f"Frostkontroll misslyckades: {e}", file=sys.stderr)
+        ping(env.get("HEARTBEAT_URL"), fail=True,
+             body="\n".join([f"Frostkontrollen misslyckades: {e}"] + notes))
         return False
-    ping(env.get("HEARTBEAT_URL"))
+    ping(env.get("HEARTBEAT_URL"),
+         body="\n".join([f"Frostkontroll ok (åtgärd: {action})"] + notes))
     return True
 
 
-def ping(url):
-    """Hjärtslag till en extern övervakning (t.ex. healthchecks.io). Fel ignoreras."""
+def ping(url, fail=False, body=""):
+    """Hjärtslag till extern övervakning (healthchecks.io eller kompatibel).
+
+    Lyckat: POST till url. Fel: POST till url + "/fail", så övervakningen larmar
+    direkt i stället för att vänta ut karenstiden. Texten (max 10 kB) visas i
+    övervakningens logg. Fel vid själva pingen ignoreras. Returnerar HTTP-status
+    eller None."""
     url = clean(url or "")
     if not url:
-        return
+        return None
+    target = url.rstrip("/") + ("/fail" if fail else "")
+    data = (body or "").encode()[:10_000]
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        urllib.request.urlopen(req, timeout=10).close()
+        req = urllib.request.Request(target, data=data, method="POST",
+                                     headers={"User-Agent": USER_AGENT,
+                                              "Content-Type": "text/plain; charset=utf-8"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status
     except Exception as e:
         print(f"Hjärtslag misslyckades: {e}", file=sys.stderr)
+        return None
+
+
+def send_notice(env):
+    """Morgonnotisen, med eget hjärtslag (HEARTBEAT_NOTICE_URL) så att en
+    utebliven notis upptäcks utifrån."""
+    try:
+        run_once(env)
+    except Exception as e:
+        ping(env.get("HEARTBEAT_NOTICE_URL"), fail=True, body=f"Notisen kunde inte skickas: {e}")
+        raise
+    ping(env.get("HEARTBEAT_NOTICE_URL"), body="Morgonnotisen skickad")
+
+
+def test_heartbeat(env):
+    """Skickar en testping till båda adresserna och visar svaret."""
+    for key in ("HEARTBEAT_URL", "HEARTBEAT_NOTICE_URL"):
+        url = clean(env.get(key) or "")
+        if not url:
+            print(f"{key}: inte satt")
+            continue
+        st = ping(url, body="Test från tempwatch --test-heartbeat")
+        print(f"{key}: {'OK' if st == 200 else 'FEL'} (HTTP {st})")
 
 
 def debug_ecowitt(env):
@@ -1021,6 +1060,7 @@ def main():
     ap.add_argument("--debug-ecowitt", action="store_true")
     ap.add_argument("--debug-energy", action="store_true")
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--test-heartbeat", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     env = os.environ
@@ -1042,8 +1082,14 @@ def main():
     if a.debug_energy:
         debug_energy(env)
         return
-    if a.once or a.dry_run:
-        run_once(env, dry=a.dry_run)
+    if a.test_heartbeat:
+        test_heartbeat(env)
+        return
+    if a.dry_run:
+        run_once(env, dry=True)
+        return
+    if a.once:
+        send_notice(env)
         return
     for w in config_warnings(env):
         print(f"Varning: {w}", file=sys.stderr)
@@ -1060,7 +1106,7 @@ def main():
             next_sample = next_sample_time(time.time())
         if now >= next_send:
             try:
-                run_once(env)
+                send_notice(env)
             except Exception as e:  # håll loopen vid liv
                 print(f"Fel: {e}", file=sys.stderr)
             next_send = time.time() + 61 + seconds_until_next(

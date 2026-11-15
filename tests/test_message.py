@@ -684,21 +684,6 @@ def test_watchdog_alarm_retried_if_telegram_fails():
         o.ecowitt_reading, o.telegram_send = oe, ot
 
 
-def test_ping_ignores_failures_and_empty_url():
-    import urllib.request
-    o.ping("")                                               # ingen krasch, inget anrop
-    orig = urllib.request.urlopen
-    def boom(req, timeout=0):
-        raise OSError("nere")
-    urllib.request.urlopen = boom
-    try:
-        o.ping("https://hc-ping.example/abc")
-    finally:
-        urllib.request.urlopen = orig
-
-
-# ---------- granskning 2: rättningar ----------
-
 def _fresh_ecowitt(outdoor, indoor):
     import time as _t
     ts = str(int(_t.time()))
@@ -746,23 +731,6 @@ def test_invalid_alert_setting_falls_back_to_default_and_is_reported():
 def test_run_once_reports_invalid_setting():
     msg, _ = _run({**PRICE_ENV, "ANOMALY_FACTOR": "x"}, [])
     assert "ogiltig inställning ANOMALY_FACTOR='x'" in msg
-
-
-def test_heartbeat_only_when_frost_check_succeeds():
-    pings = []
-    saved = {k: getattr(o, k) for k in ("sample_devices", "check_frost", "ping")}
-    o.sample_devices = lambda e: None
-    o.ping = lambda url: pings.append(url)
-    try:
-        o.check_frost = lambda e: None
-        assert o.sample_cycle({"HEARTBEAT_URL": "u"}) is True and pings == ["u"]
-        def boom(e):
-            raise RuntimeError("Telegram nere")
-        o.check_frost = boom
-        assert o.sample_cycle({"HEARTBEAT_URL": "u"}) is False and pings == ["u"]
-    finally:
-        for k, v in saved.items():
-            setattr(o, k, v)
 
 
 def test_rooms_kept_when_ecowitt_down():
@@ -834,3 +802,99 @@ def test_window_energy_lists_missing_hours():
             if not (NOW - 12 * HOUR <= r["t"] < NOW - 11 * HOUR)]
     r = o.window_energy(o.hourly_totals(rows)[11], NOW - 24 * HOUR, NOW)
     assert r["missing_at"] == [int((NOW - 12 * HOUR) // HOUR)]
+
+
+# ---------- hjärtslag ----------
+
+class _Resp:
+    status = 200
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+
+
+def _capture_urlopen():
+    import urllib.request
+    calls = []
+    def fake(req, timeout=0):
+        calls.append((req.full_url, req.get_method(), req.data))
+        return _Resp()
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = fake
+    return calls, lambda: setattr(urllib.request, "urlopen", orig)
+
+
+def test_ping_success_and_fail_urls_and_body():
+    calls, restore = _capture_urlopen()
+    try:
+        assert o.ping("") is None and calls == []
+        assert o.ping(" https://hc-ping.com/abc/ ", body="ok") == 200
+        o.ping("https://hc-ping.com/abc", fail=True, body="x" * 20_000)
+    finally:
+        restore()
+    assert calls[0] == ("https://hc-ping.com/abc", "POST", b"ok")
+    assert calls[1][0] == "https://hc-ping.com/abc/fail" and len(calls[1][2]) == 10_000
+
+
+def test_ping_never_raises():
+    import urllib.request
+    orig = urllib.request.urlopen
+    def boom(req, timeout=0):
+        raise OSError("nere")
+    urllib.request.urlopen = boom
+    try:
+        assert o.ping("https://hc-ping.com/abc") is None
+    finally:
+        urllib.request.urlopen = orig
+
+
+def _cycle(check, sample_ok=True):
+    pings = []
+    saved = {k: getattr(o, k) for k in ("sample_devices", "check_frost", "ping")}
+    def sample(e):
+        if not sample_ok:
+            raise RuntimeError("Adax 502")
+    o.sample_devices, o.check_frost = sample, check
+    o.ping = lambda url, fail=False, body="": pings.append((url, fail, body))
+    try:
+        ok = o.sample_cycle({"HEARTBEAT_URL": "u"})
+    finally:
+        for k, v in saved.items():
+            setattr(o, k, v)
+    return ok, pings
+
+
+def test_heartbeat_success_and_fail():
+    ok, pings = _cycle(lambda e: None)
+    assert ok is True and pings == [("u", False, "Frostkontroll ok (åtgärd: None)")]
+    def boom(e):
+        raise RuntimeError("Telegram nere")
+    ok, pings = _cycle(boom)
+    assert ok is False and pings[0][1] is True and "Telegram nere" in pings[0][2]
+
+
+def test_heartbeat_mentions_failed_adax_sampling_without_failing():
+    ok, pings = _cycle(lambda e: "alarm", sample_ok=False)
+    assert ok is True and pings[0][1] is False
+    assert "åtgärd: alarm" in pings[0][2] and "Adax 502" in pings[0][2]
+
+
+def test_send_notice_pings_notice_check():
+    pings = []
+    saved = {k: getattr(o, k) for k in ("run_once", "ping")}
+    o.ping = lambda url, fail=False, body="": pings.append((url, fail))
+    env = {"HEARTBEAT_NOTICE_URL": "n"}
+    try:
+        o.run_once = lambda e: None
+        o.send_notice(env)
+        def boom(e):
+            raise RuntimeError("Telegram nere")
+        o.run_once = boom
+        try:
+            o.send_notice(env)
+            assert False
+        except RuntimeError:
+            pass
+    finally:
+        for k, v in saved.items():
+            setattr(o, k, v)
+    assert pings == [("n", False), ("n", True)]

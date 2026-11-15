@@ -63,6 +63,6 @@ Alla externa anrop mockas; inga nycklar behövs. CI kör samma tester vid varje 
 - Adax `energy_log` saknar ibland hela dygn, därför är de egna proverna primär källa.
 - Medelspotpriset är ett oviktat medelvärde över perioden, inte viktat mot när elementen drog.
 - Elementkontrollen kan inte avgöra om förbrukningen beror på ändrad måltemperatur eller väder.
-- Frost- och vakthundslarmen går via Telegram. Utan `HEARTBEAT_URL` upptäcks inte att själva containern eller
-  Telegram har slutat fungera.
+- Frost- och vakthundslarmen går via Telegram. Avbrott i servern, containern eller Telegram upptäcks bara
+  med extern övervakning (`HEARTBEAT_URL`, `HEARTBEAT_NOTICE_URL`, se docs/drift.md).
 - Styrning av elementen via Telegram är inte byggd.

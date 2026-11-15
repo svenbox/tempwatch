@@ -39,9 +39,34 @@ Elementkontroll: inga avvikelser        eller en lista, eller "samlar data (x/3 
 
 Frostlarmet bygger bara på inomhussensorn: en död utomhussensor visas som `Utomhus: okänt`
 men stoppar inte larmet. Frostlarmet ignorerar föråldrad data. Ett larm som inte kunde skickas försöks igen vid nästa
-provtagning. Hjärtslaget (`HEARTBEAT_URL`) skickas bara när frostkontrollen gick igenom,
-så den externa övervakningen larmar även när frostlarmet inte fungerar. **Larmen kommer inte fram om containern, servern, nätet eller Telegram är nere.** Sätt
-`HEARTBEAT_URL` till en extern övervakning (t.ex. healthchecks.io) för att upptäcka det.
+provtagning. Se *Extern övervakning* nedan för hur avbrott upptäcks. **Larmen kommer inte fram om containern, servern, nätet eller Telegram är nere**; det
+fångas av den externa övervakningen.
+
+## Extern övervakning (healthchecks.io)
+Larmen ovan går via servern och din Telegram-bot. Är servern, nätet, containern eller
+Telegram nere hörs ingenting. Därför pingar tempwatch en extern tjänst, som larmar *dig*
+när pingarna uteblir eller signalerar fel. Det går helt utanför servern.
+
+**Sätt upp (en gång):**
+1. Skapa ett konto på healthchecks.io.
+2. Skapa kontrollen **tempwatch frost**: *Simple*, period **15 minuter**, grace **30 minuter**.
+3. Skapa kontrollen **tempwatch notis**: *Cron*, uttryck `30 7 * * *`, tidszon
+   **Europe/Stockholm**, grace **30 minuter**.
+4. Under *Integrations*: e-post finns från början. Lägg gärna till Telegram om tjänsten
+   erbjuder det; det är då en annan bot än din egen.
+5. Kopiera kontrollernas ping-adresser till env-filen:
+   ```
+   HEARTBEAT_URL=https://hc-ping.com/<uuid för tempwatch frost>
+   HEARTBEAT_NOTICE_URL=https://hc-ping.com/<uuid för tempwatch notis>
+   ```
+6. `docker compose up -d`, sedan `docker compose run --rm tempwatch python tempwatch.py --test-heartbeat`.
+   Båda ska svara `OK (HTTP 200)`, och testet syns i kontrollernas logg.
+
+**Vad som pingas:**
+| Kontroll | Lyckat | Fel (`/fail`, larmar direkt) | Uteblir (larmar efter grace) |
+|---|---|---|---|
+| frost | efter varje frostkontroll, med åtgärd och ev. Adax-fel i loggen | frostkontrollen kraschade eller ett larm kunde inte skickas | containern, servern eller nätet nere |
+| notis | morgonnotisen skickad | notisen kunde inte skickas | ingen notis kl 07:30 |
 
 ## Filer och tillstånd (`/var/lib/tempwatch` → `/state`)
 | Fil | Innehåll |
@@ -61,6 +86,7 @@ cd /home/svante/docker/tempwatch
 docker compose run --rm tempwatch python tempwatch.py --dry-run        # visa notisen, skicka inte
 docker compose run --rm tempwatch python tempwatch.py --once          # skicka nu
 docker compose run --rm tempwatch python tempwatch.py --check-frost --dry-run   # frostläge och vakthund
+docker compose run --rm tempwatch python tempwatch.py --test-heartbeat  # testping till extern övervakning
 docker compose run --rm tempwatch python tempwatch.py --debug-ecowitt # råsvar och mätningens ålder
 docker compose run --rm tempwatch python tempwatch.py --debug-energy  # egna prover mot Adax dygnssumma
 docker compose run --rm tempwatch python tempwatch.py --debug-devices # råsvar från Adax (element)
