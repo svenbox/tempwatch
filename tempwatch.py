@@ -9,7 +9,7 @@ Körning:
   python tempwatch.py             # loop: skickar kl 07:30 och loggar element var 15:e minut
 Frostlarm: --check-frost [--dry-run]
 Övervakning: --test-heartbeat (HEARTBEAT_URL, HEARTBEAT_NOTICE_URL)
-Felsökning: --debug-ecowitt, --debug-price, --debug-devices, --debug-energy, --debug-semantics
+Felsökning: --debug-ecowitt, --debug-price, --debug-month-spot ÅÅÅÅ-MM, --debug-devices, --debug-energy, --debug-semantics
 """
 import argparse
 import datetime as dt
@@ -214,24 +214,45 @@ def adax_energy(env, token, room_ids, start_ms, now_ms, state):
     return total, est, new
 
 
-def spot_average(area, start_ms, now_ms):
+def spot_day(area, day, cache_dir=None):
+    """Spotpriser för ett dygn. Avslutade dygn cachas på disk (de ändras inte)."""
+    today = dt.datetime.now(TZ).date()
+    path = os.path.join(cache_dir, f"{day:%Y-%m-%d}_{area}.json") if cache_dir else None
+    if path and day < today:
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+    url = (f"https://www.elprisetjustnu.se/api/v1/prices/"
+           f"{day.year}/{day:%m-%d}_{area}.json")
+    try:
+        rows = http_json(url)
+    except RuntimeError as e:
+        if "HTTP 404" not in str(e):
+            raise
+        return []
+    if path and day < today and rows:
+        try:  # cache är bara en optimering; fel här ska inte märkas
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(path + ".tmp", "w") as f:
+                json.dump(rows, f)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+    return rows
+
+
+def spot_average(area, start_ms, now_ms, cache_dir=None):
     """Medelspotpris (kr/kWh, exkl. moms) för elområdet över perioden.
 
-    Källa: elprisetjustnu.se (öppet API, ingen nyckel). Obevakat medelvärde
+    Källa: elprisetjustnu.se (öppet API, ingen nyckel). Oviktat medelvärde
     över alla timmar/kvartar i perioden; saknade dagar hoppas över."""
     start = dt.datetime.fromtimestamp(start_ms / 1000, TZ)
     end = dt.datetime.fromtimestamp(now_ms / 1000, TZ)
     vals, day = [], start.date()
     while day <= end.date():
-        url = (f"https://www.elprisetjustnu.se/api/v1/prices/"
-               f"{day.year}/{day:%m-%d}_{area}.json")
-        try:
-            rows = http_json(url)
-        except RuntimeError as e:
-            if "HTTP 404" not in str(e):
-                raise
-            rows = []
-        for r in rows:
+        for r in spot_day(area, day, cache_dir):
             t = dt.datetime.fromisoformat(r["time_start"])
             if start <= t < end:
                 vals.append(float(r["SEK_per_kWh"]))
@@ -239,27 +260,39 @@ def spot_average(area, start_ms, now_ms):
     return sum(vals) / len(vals) if vals else None
 
 
+def month_start_ms(now_ms):
+    """Första dagen i månaden kl 00:00 lokal tid (ms)."""
+    d = dt.datetime.fromtimestamp(now_ms / 1000, TZ)
+    return int(d.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+
 def price_per_kwh(env, start_ms, now_ms):
     """(pris kr/kWh inkl. moms | None, anteckning).
 
-    Med ELECTRICITY_AREA (t.ex. SE2): medelspot + ELECTRICITY_ADDON_SEK_PER_KWH
-    (nät, skatt, påslag; exkl. moms) + moms (ELECTRICITY_VAT, standard 0,25).
-    Annars fast ELECTRICITY_PRICE_SEK_PER_KWH."""
+    Med ELECTRICITY_AREA (t.ex. SE2): (medelspot + ELECTRICITY_ADDON_SEK_PER_KWH)
+    x (1 + moms). Medelspot räknas som standard över månaden hittills
+    (ELECTRICITY_SPOT_BASIS=month), eftersom ett rörligt avtal faktureras med
+    månadens medelspotpris; "period" ger medel över energins egen period.
+    Utan område: fast ELECTRICITY_PRICE_SEK_PER_KWH."""
     area = clean(env.get("ELECTRICITY_AREA") or "").upper()
     if area and start_ms:
-        avg = spot_average(area, start_ms, now_ms)
+        basis = clean(env.get("ELECTRICITY_SPOT_BASIS") or "month").lower()
+        frm = month_start_ms(now_ms) if basis == "month" else start_ms
+        avg = spot_average(area, frm, now_ms,
+                           os.path.join(os.path.dirname(state_path(env)), "spot"))
         if avg is None:
             raise RuntimeError(f"inga spotpriser hittades för {area} i perioden")
         addon = parse_price(env.get("ELECTRICITY_ADDON_SEK_PER_KWH")) or 0.0
         vat = parse_price(env.get("ELECTRICITY_VAT"))
         vat = 0.25 if vat is None else vat
         price = (avg + addon) * (1 + vat)
-        return price, f"{fmt_num(avg, 2)} kr/kWh spot {area}, exkl. moms"
+        label = "månaden hittills" if basis == "month" else "perioden"
+        return price, f"{fmt_num(avg * 100, 2)} öre/kWh spot {area} ({label}), exkl. moms"
     return parse_price(env.get("ELECTRICITY_PRICE_SEK_PER_KWH")), None
 
 
 NUMERIC_SETTINGS = (
-    "ELECTRICITY_ADDON_SEK_PER_KWH", "ELECTRICITY_VAT", "ELECTRICITY_PRICE_SEK_PER_KWH",
+    "ELECTRICITY_FIXED_SEK_PER_MONTH", "ELECTRICITY_ADDON_SEK_PER_KWH", "ELECTRICITY_VAT", "ELECTRICITY_PRICE_SEK_PER_KWH",
     "ANOMALY_FACTOR", "ANOMALY_MIN_EXTRA_WH", "ANOMALY_MIN_BASELINE_WH",
     "ALERT_INDOOR_BELOW_C", "ALERT_HYSTERESIS_C", "ALERT_REPEAT_HOURS",
     "ALERT_STALE_MINUTES", "ALERT_FAIL_CHECKS", "ALERT_WATCH_REPEAT_HOURS")
@@ -339,6 +372,61 @@ def energy_line(wh, price, start_ms=None, now=None, estimated=False):
     if price is None:
         line += " (elpris ej inställt)"
     return line
+
+
+MONTHS = ("januari", "februari", "mars", "april", "maj", "juni", "juli",
+          "augusti", "september", "oktober", "november", "december")
+
+
+def days_in_month(d):
+    nxt = (d.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+    return (nxt - dt.timedelta(days=1)).day
+
+
+def fixed_per_day(env, day):
+    """Fasta avgifter (kr inkl. moms) per dygn, eller None om inte inställt."""
+    fixed = env_num(env, "ELECTRICITY_FIXED_SEK_PER_MONTH", None)
+    return None if fixed is None else fixed / days_in_month(day)
+
+
+def daily_path(env):
+    return os.path.join(os.path.dirname(state_path(env)), "daily.jsonl")
+
+
+def load_daily(env):
+    """{datum: post} ur daily.jsonl; senaste posten per datum gäller."""
+    out = {}
+    try:
+        with open(daily_path(env)) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    out[r["date"]] = r
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def month_line(env, record, days):
+    """'November hittills: 123,4 kWh ≈ 145 kr (+ fasta ≈ 450 kr), 12 dygn'.
+
+    record = dagens post (datum, kWh, kr); days = sparade poster."""
+    d = dt.date.fromisoformat(record["date"])
+    month = {k: v for k, v in days.items() if k[:7] == record["date"][:7]}
+    month[record["date"]] = record
+    kwh = sum(r["kwh"] for r in month.values())
+    kr = [r["kr"] for r in month.values() if r.get("kr") is not None]
+    today = dt.datetime.now(TZ).date()
+    word = "hittills" if (d.year, d.month) == (today.year, today.month) else "totalt"
+    line = f"{MONTHS[d.month - 1].capitalize()} {word}: {fmt_num(kwh, 1)} kWh"
+    if len(kr) == len(month):
+        line += f" ≈ {fmt_num(sum(kr), 0)} kr"
+        per_day = fixed_per_day(env, d)
+        if per_day is not None:
+            line += f" (+ fasta ≈ {fmt_num(per_day * len(month), 0)} kr)"
+    return line + f", {len(month)} dygn"
 
 
 def build_message(outdoor, indoor, rooms, energy=None):
@@ -421,6 +509,21 @@ def run_once(env, dry=False):
             errors.append(f"Spotpris otillgängligt ({e})")
             price = parse_price(env.get("ELECTRICITY_PRICE_SEK_PER_KWH"))
         energy = energy_line(wh, price, start, estimated=est)
+        # Dygnets datum = mitten av perioden (notisen den 1:a gäller förra månaden).
+        day = dt.datetime.fromtimestamp((start + now_ms) / 2000, TZ).date()
+        per_day = fixed_per_day(env, day)
+        if per_day is not None:
+            energy += f"\n  Fasta avgifter (nät + elhandel): ≈ {fmt_num(per_day, 2)} kr/dygn"
+        record = {"date": day.isoformat(), "kwh": round(wh / 1000, 3),
+                  "kr": None if price is None else round(wh / 1000 * price, 2),
+                  "est": bool(est)}
+        energy += "\n" + month_line(env, record, load_daily(env))
+        if not dry:
+            try:
+                with open(daily_path(env), "a") as f:
+                    f.write(json.dumps(record) + "\n")
+            except OSError as e:
+                errors.append(f"Kan inte spara dygnsvärde ({e})")
     except Exception as e:
         errors.append(f"Energi otillgänglig ({e})")
     outdoor, indoor = eco if eco else (None, None)
@@ -1027,6 +1130,22 @@ def debug_devices(env):
     print("rumsnycklar:", sorted({k for r in j.get("rooms", []) for k in r}))
 
 
+def debug_month_spot(env, month):
+    """Oviktat medelspotpris för en hel månad (YYYY-MM), att jämföra med
+    fakturans 'Medelspotpris'. Stämmer de faktureras månadens enkla medel."""
+    area = clean(env.get("ELECTRICITY_AREA") or "").upper()
+    if not area:
+        print("ELECTRICITY_AREA saknas")
+        return
+    y, m = (int(x) for x in month.split("-"))
+    start = dt.datetime(y, m, 1, tzinfo=TZ)
+    end = dt.datetime(y + (m == 12), m % 12 + 1, 1, tzinfo=TZ)
+    avg = spot_average(area, int(start.timestamp() * 1000), int(end.timestamp() * 1000),
+                       os.path.join(os.path.dirname(state_path(env)), "spot"))
+    print(f"{area} {month}: oviktat medelspot "
+          f"{'saknas' if avg is None else fmt_num(avg * 100, 2) + ' öre/kWh exkl. moms'}")
+
+
 def debug_price(env):
     """Visar vilka prisinställningar som lästs och vad spot-API:et ger."""
     keys = ("ELECTRICITY_AREA", "ELECTRICITY_ADDON_SEK_PER_KWH",
@@ -1061,6 +1180,7 @@ def main():
     ap.add_argument("--debug-energy", action="store_true")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--test-heartbeat", action="store_true")
+    ap.add_argument("--debug-month-spot", metavar="ÅÅÅÅ-MM")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     env = os.environ
@@ -1081,6 +1201,9 @@ def main():
         return
     if a.debug_energy:
         debug_energy(env)
+        return
+    if a.debug_month_spot:
+        debug_month_spot(env, a.debug_month_spot)
         return
     if a.test_heartbeat:
         test_heartbeat(env)

@@ -19,7 +19,8 @@ kontroll av element. Endast Python 3.12 och standardbiblioteket.
   inomhussensorn inte rapporterat på 90 minuter, och meddelar när det fungerar igen. Föråldrad
   temperatur används aldrig för frostlarmet. Sätt `HEARTBEAT_URL` till en extern övervakning
   (t.ex. healthchecks.io) för att även upptäcka att containern, nätet eller Telegram har slutat fungera.
-- **Elkostnad** = energi × (medelspotpris i elområdet + påslag) × (1 + moms).
+- **Elkostnad** = energi × (månadens medelspotpris hittills + påslag) × (1 + moms), plus fasta
+  avgifter per dygn och en månadssumma. Modellen är kontrollerad mot fakturorna (docs/drift.md).
 - **Elementkontroll** jämför varje element med sitt eget normalläge (kräver 3 dygn data).
 
 ## Mer dokumentation
@@ -61,7 +62,7 @@ Alla externa anrop mockas; inga nycklar behövs. CI kör samma tester vid varje 
 
 ## Kända begränsningar
 - Adax `energy_log` saknar ibland hela dygn, därför är de egna proverna primär källa.
-- Medelspotpriset är ett oviktat medelvärde över perioden, inte viktat mot när elementen drog.
+- Medelspot är månadens oviktade medel; avviker fakturans *Medelspotpris* (t.ex. förbrukningsviktat) blir kostnaden något fel.
 - Elementkontrollen kan inte avgöra om förbrukningen beror på ändrad måltemperatur eller väder.
 - Frost- och vakthundslarmen går via Telegram. Avbrott i servern, containern eller Telegram upptäcks bara
   med extern övervakning (`HEARTBEAT_URL`, `HEARTBEAT_NOTICE_URL`, se docs/drift.md).

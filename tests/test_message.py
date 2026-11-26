@@ -121,8 +121,11 @@ def test_spot_average_and_price(monkeypatch=None):
         start = int(dt.datetime(2026, 11, 3, 4, 0, tzinfo=o.TZ).timestamp() * 1000)
         now = int(dt.datetime(2026, 11, 3, 7, 30, tzinfo=o.TZ).timestamp() * 1000)
         assert abs(o.spot_average("SE4", start, now) - 0.5) < 1e-9
+        import tempfile, os
         price, note = o.price_per_kwh(
-            {"ELECTRICITY_AREA": "se4", "ELECTRICITY_ADDON_SEK_PER_KWH": "0,50"}, start, now)
+            {"ELECTRICITY_AREA": "se4", "ELECTRICITY_ADDON_SEK_PER_KWH": "0,50",
+             "ELECTRICITY_SPOT_BASIS": "period",
+             "TEMPWATCH_STATE": os.path.join(tempfile.mkdtemp(), "s.json")}, start, now)
         assert abs(price - (0.5 + 0.5) * 1.25) < 1e-9 and "SE4" in note
     finally:
         o.http_json = orig
@@ -133,11 +136,14 @@ def test_fixed_price_fallback():
 
 
 def test_missing_spot_raises_instead_of_silent_none():
+    import tempfile, os
     orig = o.http_json
     o.http_json = lambda url, **k: []
     try:
         try:
-            o.price_per_kwh({"ELECTRICITY_AREA": "SE2"}, 1793674800000, 1793716591783)
+            o.price_per_kwh({"ELECTRICITY_AREA": "SE2",
+                             "TEMPWATCH_STATE": os.path.join(tempfile.mkdtemp(), "s.json")},
+                            1793674800000, 1793716591783)
             assert False, "borde ha kastat"
         except RuntimeError as e:
             assert "SE2" in str(e)
@@ -434,7 +440,7 @@ def _run(env, samples, adax_down=False, eco_down=False):
         {"id": 1, "name": "Kök", "heatingEnabled": True, "temperature": 1680,
          "targetTemperature": 1800}]}
     o.adax_points = lambda t, r: (calls.append("adax_points") or [])
-    o.spot_average = lambda a, s, n: 0.10
+    o.spot_average = lambda a, s, n, *rest: 0.10
     o.telegram_send = lambda e, text: calls.append(("send", text))
     o.window_start = lambda now=None: int(NOW_REAL - 24 * H)
     try:
@@ -898,3 +904,92 @@ def test_send_notice_pings_notice_check():
         for k, v in saved.items():
             setattr(o, k, v)
     assert pings == [("n", False), ("n", True)]
+
+
+# ---------- förfinad elberäkning ----------
+
+def _tmp_env(**kw):
+    import tempfile, os
+    return {"TEMPWATCH_STATE": os.path.join(tempfile.mkdtemp(), "s.json"), **kw}
+
+
+def test_model_matches_october_invoices():
+    # Oktober 2026: 610 kWh, medelspot 36,52 öre. Fakturornas rörliga delar inkl. moms:
+    # Fyrfasen 393,17 - fast 36*1,25 = 348,17; Ellevio överföring 158,54 + skatt 274,40.
+    addon = 0.06 + 0.0418 - 0.01 + 0.36 + 0.208
+    model = 610 * (0.3652 + addon) * 1.25
+    invoices = (393.17 - 36 * 1.25) + 158.54 + 274.40
+    assert abs(model - invoices) < 1.0
+
+
+def test_price_uses_month_to_date_spot_by_default():
+    import datetime as dt
+    seen = []
+    orig = o.spot_average
+    o.spot_average = lambda area, frm, now, cache=None: (seen.append(frm), 0.40)[1]
+    try:
+        now = int(dt.datetime(2026, 11, 14, 7, 30, tzinfo=o.TZ).timestamp() * 1000)
+        start = now - 24 * 3600 * 1000
+        env = _tmp_env(ELECTRICITY_AREA="SE2", ELECTRICITY_ADDON_SEK_PER_KWH="0,6598")
+        price, note = o.price_per_kwh(env, start, now)
+        o.price_per_kwh({**env, "ELECTRICITY_SPOT_BASIS": "period"}, start, now)
+    finally:
+        o.spot_average = orig
+    assert seen[0] == int(dt.datetime(2026, 11, 1, tzinfo=o.TZ).timestamp() * 1000)
+    assert seen[1] == start
+    assert abs(price - (0.40 + 0.6598) * 1.25) < 1e-9 and "månaden hittills" in note
+
+
+def test_spot_day_caches_finished_days_only():
+    import datetime as dt, tempfile
+    calls = []
+    orig = o.http_json
+    o.http_json = lambda url, **k: (calls.append(url), [{"time_start": "x", "SEK_per_kWh": 1}])[1]
+    cache = tempfile.mkdtemp()
+    try:
+        old = dt.date(2026, 10, 5)
+        o.spot_day("SE2", old, cache)
+        o.spot_day("SE2", old, cache)                     # från cache
+        today = dt.datetime.now(o.TZ).date()
+        o.spot_day("SE2", today, cache)
+        o.spot_day("SE2", today, cache)                   # idag hämtas alltid
+    finally:
+        o.http_json = orig
+    assert len(calls) == 3
+
+
+def test_fixed_per_day_and_month_line():
+    import datetime as dt
+    env = _tmp_env(ELECTRICITY_FIXED_SEK_PER_MONTH="635")
+    assert abs(o.fixed_per_day(env, dt.date(2026, 11, 14)) - 635 / 30) < 1e-9
+    assert o.fixed_per_day(_tmp_env(), dt.date(2026, 11, 14)) is None
+    today = dt.datetime.now(o.TZ).date()
+    d1, d2 = today.replace(day=1), today
+    if d1 == d2:
+        d1 = d2 - dt.timedelta(days=40)                   # annan månad: räknas inte
+    days = {d1.isoformat(): {"date": d1.isoformat(), "kwh": 10.0, "kr": 12.0}}
+    rec = {"date": d2.isoformat(), "kwh": 5.5, "kr": 6.5}
+    line = o.month_line(env, rec, days)
+    month = o.MONTHS[d2.month - 1].capitalize()
+    if d1.month == d2.month:
+        n = 2
+        assert line.startswith(f"{month} hittills: 15,5 kWh ≈ 18 kr")
+    else:
+        n = 1
+        assert line.startswith(f"{month} hittills: 5,5 kWh ≈ 6 kr")
+    assert f", {n} dygn" in line and "+ fasta ≈" in line
+
+
+def test_month_line_says_totalt_for_previous_month():
+    import datetime as dt
+    rec = {"date": "2020-10-31", "kwh": 7.0, "kr": 8.0}      # alltid en tidigare månad
+    assert o.month_line(_tmp_env(), rec, {}) == "Oktober totalt: 7,0 kWh ≈ 8 kr, 1 dygn"
+
+
+def test_run_once_writes_daily_record_and_shows_month_and_fixed():
+    import json, os
+    env = {**PRICE_ENV, "ELECTRICITY_FIXED_SEK_PER_MONTH": "635"}
+    rows = _saw(26, {11: 100, 12: 50}, end=int(NOW_REAL), room_of=lambda i: 1)
+    msg, _ = _run(env, rows)
+    assert "Fasta avgifter (nät + elhandel): ≈" in msg
+    assert "hittills:" in msg or "totalt:" in msg

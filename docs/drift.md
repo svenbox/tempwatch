@@ -23,8 +23,12 @@ Elementkontroll: inga avvikelser        eller en lista, eller "samlar data (x/3 
 - **Energi** = summan över alla element av timmarnas största värde. `– uppskattat` betyder att
   några timmar saknade prov och fylldes med elementets medel. Faller tillbaka på Adax dygnspunkter
   om fler än fyra timmar saknas.
-- **Kostnad** = energi × (medelspot för perioden + påslag) × (1 + moms). Det är en uppskattning:
-  spotpriset är ett oviktat medelvärde, och Adax visar inte när på dygnet elementen drog.
+- **Kostnad** = energi × (medelspot + påslag) × (1 + moms). Se *Elkostnad* nedan.
+- **Fasta avgifter** (om inställt) visas per dygn. De beror inte på förbrukningen och ingår
+  inte i energins kostnad.
+- **Månadsraden** summerar notisernas dygn. Varje dygn räknas till periodens mittpunkt, så
+  notisen den 1:a visar förra månaden `totalt`, att jämföra med fakturan. Den gäller bara
+  Adax-elementen; fakturan gäller hela huset.
 - **Elementkontroll** jämför varje element med sitt eget normalläge de senaste dygnen. Element
   som varit nästan avstängda (under `ANOMALY_MIN_BASELINE_WH`) jämförs inte. Kräver 3 dygn data.
 - En `⚠`-rad betyder att en källa var otillgänglig, att en inställning är felskriven
@@ -75,6 +79,8 @@ när pingarna uteblir eller signalerar fel. Det går helt utanför servern.
 | `snapshots.json` | Reservdata för energi via Adax dygnspunkter |
 | `alert.json` | Frostlarmets tillstånd |
 | `notice.json` | Datum för senast skickade morgonnotis (för ersättningsnotis) |
+| `daily.jsonl` | Ett dygnsvärde per notis (kWh, kr) för månadsraden |
+| `spot/` | Cache av spotpriser för avslutade dygn |
 | `watch.json` | Vakthundens tillstånd |
 
 Katalogen ska ägas av `1000:1000`. Hemligheter ligger bara i `/etc/tempwatch/tempwatch.env`
@@ -92,6 +98,7 @@ docker compose run --rm tempwatch python tempwatch.py --debug-energy  # egna pro
 docker compose run --rm tempwatch python tempwatch.py --debug-devices # råsvar från Adax (element)
 docker compose run --rm tempwatch python tempwatch.py --debug-semantics # hur energyWh beter sig över timmen
 docker compose run --rm tempwatch python tempwatch.py --debug-price   # prisinställningar och spotpris
+docker compose run --rm tempwatch python tempwatch.py --debug-month-spot 2026-10  # månadens medelspot mot fakturan
 docker compose logs --tail 50                                        # fel från containern
 ```
 `docker compose up -d --build` startar om containern (efter `git pull`). Var containern nere
@@ -118,6 +125,30 @@ sudo sed -i '/^ALERT_INDOOR_BELOW_C=20$/d' /etc/tempwatch/tempwatch.env && docke
 | Ingen notis kl 07:30 | Containern stoppad över 07:30 | `docker compose ps`, `docker compose logs --tail 50`; startas den före 12:00 skickas notisen i efterhand |
 | `– uppskattat` på energiraden | Någon timme saknar prov efter :40 | `--debug-energy` listar vilka timmar och element |
 | Energin ser dubbelt/halvt så stor ut som förväntat | Adax ändrat vad `energyWh` betyder | Kör `--debug-semantics` och `--debug-energy` |
+
+## Elkostnad
+Ett rörligt avtal faktureras med **månadens medelspotpris** (fakturaraden *Medelspotpris*).
+Därför räknas spotdelen som medel över månaden hittills, inte över dygnet: det är det pris
+dygnets kWh faktiskt kommer att debiteras. Kontrollera mot fakturan med
+`--debug-month-spot ÅÅÅÅ-MM`: ger den samma öre/kWh som fakturan är modellen exakt.
+
+`ELECTRICITY_ADDON_SEK_PER_KWH` (kr/kWh exkl. moms) är summan av fakturornas rörliga rader
+utöver spot. Ta beloppen *exkl. moms*; Ellevios rader anges inkl. moms, dela med 1,25.
+
+| Rad | Faktura okt 2026 | Exkl. moms, kr/kWh |
+|---|---|---|
+| Fyrfasen: Fasta påslag | 6,00 öre exkl. | 0,0600 |
+| Fyrfasen: Rörliga kostnader | 4,18 öre exkl. (varierar per månad) | 0,0418 |
+| Fyrfasen: Rabatt Trogen Kund | −1,00 öre exkl. | −0,0100 |
+| Ellevio: Energiskatt | 45,00 öre inkl. | 0,3600 |
+| Ellevio: Överföringsavgift | 26,00 öre inkl. | 0,2080 |
+| **Summa** | | **0,6598** |
+
+Fasta avgifter (`ELECTRICITY_FIXED_SEK_PER_MONTH`, inkl. moms): Ellevio 590 kr/mån +
+Fyrfasen 36 kr/mån exkl. moms (45 kr inkl.) = 635 kr/mån.
+
+Kontroll mot oktober 2026 (610 kWh, medelspot 36,52 öre): modellen ger 781,56 kr rörligt,
+fakturorna 781,11 kr.
 
 ## Underhåll
 Följande ändras av någon annan, och kostnaden i notisen blir fel om de inte uppdateras
